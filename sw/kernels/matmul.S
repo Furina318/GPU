@@ -15,6 +15,7 @@
         slli  r7, r7, 2           ; row*4
         add   r1, r1, r7          ; A 第 row 列基址(A 列主序 ⇒ A[k][row] 随 k 以 M*4 步进)
         imad  r3, r7, r5, r3      ; C 行基址 = c_base + row*N*4 ← imad:乘数 N 已在寄存器
+        addi  r3, r3, 96          ; 指向本行最后一个 8 列块(N*4-32 = 96):jb 从 4 递减,写指针必须从尾部往前
         wmov  r6, wid
         slli  r6, r6, 8           ; 共享区基址 = wid*256
         tmov  r27, tid
@@ -247,7 +248,7 @@ kb_done:
         st.g  20(r3), r24
         st.g  24(r3), r25
         st.g  28(r3), r26
-        addi  r3, r3, 32          ; 下一个 j 块
+        addi  r3, r3, -32         ; 退到下一个(更低列号)的 8 列块 —— 与 jb 递减方向一致
         addi  r10, r10, -1
         setp.ne p2, r10, r0
         ipdom jb_done

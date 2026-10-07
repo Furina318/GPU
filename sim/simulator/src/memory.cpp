@@ -142,7 +142,7 @@ long Memory::load_img(const char* img_file, uint8_t sm_mask, std::string* err) {
 
     long ret = load_img_bytes(buf.data(), buf.size(), sm_mask, err);
     if (ret > 0)
-        Log("load_img: %s, %ld 字节, entry=0x%x, flags=0x%x, sm_mask=0x%x",
+        Log("load_img: %s, size=%ld, entry=0x%x, flags=0x%x, sm_mask=0x%x",
             img_file, ret, img[0].entry, img[0].flags, sm_mask);
     return ret;
 }

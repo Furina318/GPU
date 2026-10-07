@@ -15,8 +15,8 @@ struct RegFile {
     }
 };
 
-void regfile_display(const RegFile& rf, int lane);
+void isa_rf_display(const RegFile& rf, int lane);
 int  check_rf_idx(int idx, bool is_pred);
 
-#define R(lane, idx) RegFile::gpr[lane][check_rf_idx(idx, false)]
-#define P(lane, idx) RegFile::pred[lane][check_rf_idx(idx, true)]
+#define R(rf, lane, idx) ((rf).gpr[(lane)][check_rf_idx((idx), false)])
+#define P(rf, lane, idx) ((rf).pred[(lane)][check_rf_idx((idx), true)])

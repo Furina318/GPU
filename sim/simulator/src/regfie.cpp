@@ -2,7 +2,7 @@
 #include "debug.hpp"
 #include <cstdio>
 
-void regfile_display(const RegFile& rf, int lane) {
+void isa_rf_display(const RegFile& rf, int lane) {
     printf("GPR: \n");
     for (int i = 0; i < simu::NUM_GPR; ++i) {
         printf("r%-2d=0x%08x ", i, rf.gpr[lane][i]);

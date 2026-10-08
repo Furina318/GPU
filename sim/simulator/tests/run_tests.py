@@ -69,7 +69,7 @@ def main():
         return 1
 
     print("\n== 汇编镜像 ==")
-    for k in ("clear", "gouraud", "matmul"):
+    for k in ("clear", "gouraud", "matmul", "anim"):
         ok, msg = assemble(os.path.join(REPO, "sw/kernels", k + ".S"), os.path.join(OUT, k + ".bin"))
         check("汇编 sw/kernels/%s.S" % k, ok, msg)
     for f in ("nested7", "spin", "err_align", "err_bar_div", "err_deadlock", "err_recov", "err_mmio"):
@@ -77,7 +77,7 @@ def main():
         check("汇编 tests/%s.S" % f, ok, msg)
 
     print("\n== 正例: 三个内核结果校验 ==")
-    for k in ("clear", "gouraud", "matmul"):
+    for k in ("clear", "gouraud", "matmul", "anim"):     # anim 有默认参数块与参考模型(见 main.cpp)
         rc, out = run([os.path.join(OUT, k + ".bin")])
         check("%s: 退出码 0 且校验通过" % k, rc == 0 and "校验通过" in out,
               "rc=%d" % rc if rc else out[-300:])
@@ -142,7 +142,7 @@ def main():
     rc, out = run([os.path.join(OUT, "clear.bin"), "-d"], stdin=script)
     check("调试模式: si/查看/断点/继续 全程无异常", rc == 0 and "退出调试模式" in out, out[-400:])
     check("调试模式: si 打印了反汇编", "lui r10, 0x10000" in out, out[-400:])
-    check("调试模式: x 能看到常量区参数", "常量区" in out and "0x00001000" in out, out[-400:])
+    check("调试模式: x 能看到常量区参数", "常量区" in out and "0xff00ff00" in out, out[-400:])
 
     logf = os.path.join(OUT, "run.log")
     if os.path.exists(logf):
@@ -168,6 +168,10 @@ def main():
     rc, out = run([os.path.join(OUT, "clear.bin"), "--cp-demo"])
     check("CP 命令自检: SIGNAL/WAIT/READ_REG/FENCE/NOP/IRQ 全通过",
           rc == 0 and "IRQ=0xc" in out, out[-400:])
+    dum3 = os.path.join(OUT, "reg.txt")
+    rc, out = run([os.path.join(OUT, "clear.bin"), "--cp-demo", "--quiet", "--dump", "0x80000000,1," + dum3])
+    reg = int(open(dum3).read().split()[1], 16) if os.path.exists(dum3) else -1
+    check("CP 命令自检: READ_REG 把 SM_KERNEL_MASK 落到 DDR(不污染帧缓冲)", reg == 0x3, "得到 0x%x" % reg)
 
     print("\n== CP 边界与异常路径 ==")
 
@@ -265,7 +269,46 @@ def main():
     check("执行过的 PC 序列逐一比对一致(含 7 层嵌套发散与发散下的 bar.sync)",
           p2.returncode == 0 and "完全一致" in p2.stdout, (p2.stdout + p2.stderr)[-400:])
 
-    print("\n== ⑨ 与参考模型逐元素比对(matmul C 矩阵, 独立于 --check) ==")
+    print("\n== ⑨ 动画 demo(sw/demo/anim.cpp + sw/kernels/anim.S) ==")
+    anim_bin = os.path.join(OUT, "anim.bin")
+    W = 64
+    dum_a = os.path.join(OUT, "anim_f0.txt")
+    rc, out = run([anim_bin, "--warps", "8",
+                   "--param", "0=%d" % (W * W), "--param", "4=64", "--param", "8=0x10000000",
+                   "--param", "12=0", "--param", "16=%d" % (W - 1), "--param", "20=6",
+                   "--param", "24=12", "--param", "28=0xff101020", "--param", "32=0xff204080",
+                   "--param", "36=0xffffc040", "--quiet", "--no-check",
+                   "--dump", "0x10000000,%d,%s" % (W * W, dum_a)])
+    got = [int(l.split()[1], 16) for l in open(dum_a)] if os.path.exists(dum_a) else []
+    exp = []
+    for idx in range(W * W):
+        x, y = idx & (W - 1), idx >> 6
+        c = 0xff204080 if (((x + y) >> 5) & 1) else 0xff101020
+        if x + y < 12:
+            c = 0xffffc040
+        exp.append(c)
+    check("anim 内核 frame 0 与 Python 参考逐像素一致",
+          len(got) == W * W and got == exp, "得到 %d 个像素" % len(got))
+
+    demo = os.path.join(SIMDIR, "build", "anim")
+    if os.path.exists(demo):
+        frdir = os.path.join(OUT, "frames")
+        os.makedirs(frdir, exist_ok=True)
+        for f in os.listdir(frdir):
+            os.remove(os.path.join(frdir, f))
+        p4 = subprocess.run([demo, "--image", anim_bin, "--frames", "6", "--ppm-dir", frdir],
+                            capture_output=True, text=True, timeout=300)
+        outs = p4.stdout + p4.stderr
+        check("动画 demo: 6 帧全部通过画面校验(驱动自带参考模型)",
+              p4.returncode == 0 and "全部帧与参考模型一致" in outs, outs[-300:])
+        files = sorted(os.listdir(frdir))
+        hashes = {open(os.path.join(frdir, f), "rb").read() for f in files}
+        check("动画 demo: 6 帧画面互不相同(动态变化)", len(files) == 6 and len(hashes) == 6,
+              "文件 %d 个, 不同内容 %d 种" % (len(files), len(hashes)))
+        check("动画 demo: 每帧报告周期数(≈%d)" % 0,
+              "周期/帧" in outs, outs[-200:])
+
+    print("\n== ⑩ 与参考模型逐元素比对(matmul C 矩阵, 独立于 --check) ==")
     dump = os.path.join(OUT, "c.txt")
     rc, _ = run([os.path.join(OUT, "matmul.bin"), "--quiet", "--no-check", "--dump", "0x10002000,1024," + dump])
     vals = []

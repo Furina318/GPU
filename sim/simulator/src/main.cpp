@@ -70,8 +70,8 @@ static void usage(const char* a0) {
         "  --max-cycles N      周期上限(默认 1048576; 同时作为 CP 的 TIMEOUT_CYCLES)\n"
         "  --div-cost N        周期模型: div/rem 占用周期(默认 8)\n"
         "  --strict-mem        访存越出已知内存区即报错(默认只警告一次)\n"
-        "  --fb-out FILE       把帧缓冲导出为 PPM(默认 64x64, 用 --fb WxH 改)\n"
-        "  --fb WxH            帧缓冲尺寸(默认 64x64)\n"
+        "  --fb-out FILE       把帧缓冲导出为 PPM(尺寸由 --fb 决定)\n"
+        "  --fb WxH            帧缓冲尺寸(默认 640x480)\n"
         "  --view              用 SDL2 窗口显示帧缓冲(需要 SDL2; 按 ESC/关窗退出)\n"
         "  --dump A,L[,FILE]   把全局内存 [A, A+L) 按字导出(十六进制+浮点), 便于脚本比对\n"
         "  -h, --help          本帮助\n"
@@ -183,6 +183,17 @@ static Profile profile_for(const std::string& k, int warps_override, int fb_w, i
         p.params[28] = fbits(3.0f);            // tx
         p.params[32] = fbits(-1.0f);           // ty
         p.params[36] = 24;                     // stride_bytes
+    } else if (k == "anim") {                  // 动画内核: 单帧渲染时的参数(帧号 0)
+        const uint32_t W = uint32_t(fb_w);
+        p.params[0]  = W * uint32_t(fb_h);          // N
+        p.params[8]  = 0x1000'0000u;                // fb_base
+        p.params[12] = 0;                           // frame(host 驱动每帧改这一个字)
+        p.params[16] = W - 1;                       // W_mask
+        p.params[20] = uint32_t(std::log2(double(W)));   // H_shift
+        p.params[24] = 12;                          // box_size(菱形半径)
+        p.params[28] = 0xFF102040u;                 // bg0
+        p.params[32] = 0xFF2060A0u;                 // bg1
+        p.params[36] = 0xFFFFC040u;                 // box_color
     } else if (k == "matmul") {
         p.params[0]  = 0x1000'0000u;           // a_base(A 列主序, M×K)
         p.params[4]  = 0x1000'1000u;           // b_base(B 行主序, K×N)
@@ -193,6 +204,7 @@ static Profile profile_for(const std::string& k, int warps_override, int fb_w, i
     }
     if (warps_override > 0) p.warps = warps_override;
     if (k == "clear") p.params[8] = uint32_t(p.warps * WARP_SIZE);
+    if (k == "anim")  p.params[4] = uint32_t(p.warps * WARP_SIZE);   // stride_elems(驱动契约)
     return p;
 }
 
@@ -280,6 +292,31 @@ static int check_result(Machine& m, const std::string& k, const std::map<uint32_
             return 3;
         }
         LogI("gouraud 校验通过: %u 个顶点的仿射变换与颜色透传全部按位一致", N);
+        return 0;
+    }
+
+    if (k == "anim") {
+        const uint32_t N = gp(0, 4096), fb = gp(8, m.fb_base), frame = gp(12, 0);
+        const uint32_t mask = gp(16, 63), shift = gp(20, 6), box = gp(24, 12);
+        const uint32_t bg0 = gp(28, 0), bg1 = gp(32, 0), boxc = gp(36, 0);
+        const uint32_t bx = (frame * 3) & mask, by = (frame * 2) & mask;
+        uint32_t bad = 0, first = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t x = i & mask, y = i >> shift;
+            uint32_t e = ((((x + y + frame * 4) >> 5) & 1) ? bg1 : bg0);
+            if (((x - bx) & mask) + ((y - by) & mask) < box) e = boxc;
+            if (rd(m, fb + i * 4) != e) { if (!bad) first = i; ++bad; }
+        }
+        if (bad) {
+            LogE("anim 校验失败: %u/%u 个像素不符; 首个 像素 %u (x=%u y=%u) = 0x%08x, 期望 0x%08x",
+                 bad, N, first, first & mask, first >> shift, rd(m, fb + first * 4),
+                 [&] { const uint32_t x = first & mask, y = first >> shift;
+                       uint32_t e = ((((x + y + frame * 4) >> 5) & 1) ? bg1 : bg0);
+                       if (((x - bx) & mask) + ((y - by) & mask) < box) e = boxc; return e; }());
+            return 3;
+        }
+        LogI("anim 校验通过: %u 个像素与参考模型一致(帧 %u;条纹 32 像素 + 半径 %u 的菱形块)",
+             N, frame, box);
         return 0;
     }
 
@@ -604,6 +641,14 @@ int main(int argc, char** argv) {
     gpu.model.div_cost = o.div_cost;
     gpu.strict_mem = o.strict_mem;
 
+    if (o.kernel == "anim") {
+        auto pow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
+        if (o.fb_w != o.fb_h || !pow2(o.fb_w)) {
+            LogI("anim 内核要求方形、边长为 2 的幂的画布(用 and/srl 从像素号取 x/y);"
+                 "把画布从 %dx%d 调整为 64x64(需要别的尺寸用 --fb 128x128 这类)", o.fb_w, o.fb_h);
+            o.fb_w = o.fb_h = 64;
+        }
+    }
     const Profile prof = profile_for(o.kernel, o.warps, o.fb_w, o.fb_h);
     std::map<uint32_t, uint32_t> P = prof.params;
     for (const auto& kv : o.params) P[kv.first] = kv.second;
@@ -672,7 +717,8 @@ int main(int argc, char** argv) {
             const uint32_t sem = cp.sem_base();
             bool ok = cp.submit_signal(sem + 7 * 4, 0x1234u, &err) &&
                       cp.submit_wait(sem + 3 * 4, 1, &err) &&
-                      cp.submit_read_reg(MMIO_SM_KERNEL_MASK, 0x1000'4000u, &err) &&
+                      // dst 放到 DDR: 别落在帧缓冲里(帧缓冲大小是可配的, 写进去会污染画面)
+                      cp.submit_read_reg(MMIO_SM_KERNEL_MASK, 0x8000'0000u, &err) &&
                       cp.submit_fence(&err) &&
                       cp.submit_nop(4, &err) &&
                       cp.submit_irq(3, &err);

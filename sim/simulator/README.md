@@ -8,13 +8,18 @@ MMIO、信号量)真正**跑起来**的 C++17 程序。它有两个用途:
    RTL 与这里的**逐元素**(而不是只看第 0 行)结果必须一致。
 
 ```
-make            # 编译 build/simulator
+make            # 编译 build/simulator(命令行前端) + build/anim(动画 demo)
 make run                          # 汇编 clear.S 并运行
 make run KERNEL=matmul ARGS="--log m.log"
 make debug KERNEL=matmul          # 直接进交互式调试器
 make check                        # 跑全部内核 + 结果校验
-make test                         # 回归测试(正例 + ISA/CMDS 错误路径 + 三种运行模式)
+make test                         # 回归测试(正例 + ISA/CMDS 错误路径 + 运行模式 + 动画)
+make anim DEMO_ARGS="--ascii"     # 动画 demo(sw/demo/anim.cpp, 见 sw/demo/README.md)
 ```
+
+构建产物:`build/libsimu.a`(除命令行前端外的全部源码)+ `build/simulator` + `build/anim`。
+库的形式是为了让 `sw/demo/` 里的 **host 驱动**能直接链接同一套 Machine/CP API —— 也就是
+PLAN.md §11"系统级: host 驱动走完整流程: 写命令 → 引擎执行 → 读回验证"。
 
 ## 1. 三种运行方式
 
@@ -94,7 +99,13 @@ trace on|off     q 退出
 - **内核访问 MMIO**: 已补 `SM*_ERROR = 6 = MMIO_ACCESS`(CMDS §8.2)。放行会让内核误写 `CP_RESET`/`DOORBELL` ——
   实测一个算错的基址会把 CP 复位掉,而 kernel 却"无错完成"、信号量永不释放; 现在直接停机报错。
 
-## 6. 明确的边界
+## 6. 动画 demo(sw/demo)
+
+`make anim` 跑 `sw/demo/anim.cpp`:画面由 `sw/kernels/anim.S` 逐像素算出,驱动每帧只推进
+`PARAMS(帧号+调色板) → LAUNCH(signal) → WAIT`,再读回帧缓冲显示(SDL 窗口 / 终端真彩色 / PPM 序列)。
+默认 64×64 约 7.8k 周期/帧(≈30 fps 墙钟),128×128 约 31k 周期/帧。细节与实测表见 `sw/demo/README.md`。
+
+## 7. 明确的边界
 
 - **`exit` 发生在发散路径里**只记 WARN 不报错: ISA D5 已从汇编层面禁止(谓词化 `exit` 汇编不过),ISA §2.6 也没有对应错误码。
 - **`ipdom` 的 recov 有效位**由"下一条**被执行**的 `br.simt`"消费(中间的普通指令不会清它)—— 这是 §5.7 "只对紧随其后的第一条 br.simt 生效"的字面实现。
@@ -109,7 +120,7 @@ trace on|off     q 退出
 - **架构错误一律硬停**(ISA §2.6): 非法指令、未对齐访存、发散下的 `bar.sync`、缺 `ipdom` 的发散、
   队列/镜像校验失败 —— 全部报错并给出 `FAULT_PC` + 出错指令 + 现场寄存器,不静默继续。
 
-## 7. 测试
+## 8. 测试
 
 `make test` 会跑 `tests/run_tests.py`(37 项)+ `tests/stack_model_check.py`:
 

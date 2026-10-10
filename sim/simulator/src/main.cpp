@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string>
@@ -183,6 +184,10 @@ static Profile profile_for(const std::string& k, int warps_override, int fb_w, i
         p.params[28] = fbits(3.0f);            // tx
         p.params[32] = fbits(-1.0f);           // ty
         p.params[36] = 24;                     // stride_bytes
+    } else if (k == "abs") {                   // §7.4: y[i] = |x[i]|, 32 个元素(≤ num_warps*8)
+        p.warps = 4;
+        p.params[0] = 0x1000'0000u;             // base(输入缓冲, 结果原地写回)
+        p.params[4] = 32;                       // N
     } else if (k == "anim") {                  // 动画内核: 单帧渲染时的参数(帧号 0)
         const uint32_t W = uint32_t(fb_w);
         p.params[0]  = W * uint32_t(fb_h);          // N
@@ -222,6 +227,18 @@ static void init_buffers(Machine& m, const std::string& k, const std::map<uint32
             for (uint32_t j = 0; j < 6; ++j) m.mem.st_global(in + (i * 6 + j) * 4, v[j]);
         }
         LogI("初始化顶点输入缓冲 0x%08x: 32 个顶点 {x=0.5i, y=0.25i, r=i, g=255-i, b=2i, a=255}", in);
+    }
+    if (k == "abs") {                          // §7.4: 输入含 -0.0/+0.0/NaN 与正负交替 ⇒ 必然发散
+        const uint32_t base = gp(0, 0x1000'0000u);
+        for (uint32_t i = 0; i < 32; ++i) {
+            float x;
+            if (i == 0)      x = -0.0f;
+            else if (i == 1) x = 0.0f;
+            else if (i == 2) x = std::numeric_limits<float>::quiet_NaN();
+            else             x = float(int(i % 7) - 3) * (i & 1 ? -1.0f : 1.0f) + 0.25f;
+            m.mem.st_global(base + i * 4, fbits(x));
+        }
+        LogI("初始化 abs 输入缓冲 0x%08x: 32 个 FP32(含 -0.0/+0.0/NaN/正负交替 ⇒ 必然发散)", base);
     }
     // matmul 内核要求 A 列主序, B 行主序, 且输入是小整数 
     else if (k == "matmul") {
@@ -295,6 +312,24 @@ static int check_result(Machine& m, const std::string& k, const std::map<uint32_
         return 0;
     }
 
+    if (k == "abs") {
+        const uint32_t base = gp(0, 0x1000'0000u), N = gp(4, 32);
+        uint32_t bad = 0, first = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            const float x = as_fp(rd(m, base + i * 4));
+            const float e = (x < 0.0f) ? -x : x;      // 与内核的 setp.flt(x, +0.0f) 语义一致
+            if (rd(m, base + i * 4) != fbits(e)) { if (!bad) first = i; ++bad; }
+        }
+        if (bad) {
+            LogE("abs 校验失败: %u/%u 个元素不符; 首个 i=%u 得到 %s", bad, N, first,
+                 fmt_bits(rd(m, base + first * 4)).c_str());
+            return 3;
+        }
+        LogI("abs 校验通过: %u 个元素与逐 lane 条件一致(-0.0 不算负、NaN 不被取负;"
+             " 发散块只以完整 mask 写回一次)", N);
+        return 0;
+    }
+
     if (k == "anim") {
         const uint32_t N = gp(0, 4096), fb = gp(8, m.fb_base), frame = gp(12, 0);
         const uint32_t mask = gp(16, 63), shift = gp(20, 6), box = gp(24, 12);
@@ -342,8 +377,8 @@ static int check_result(Machine& m, const std::string& k, const std::map<uint32_
         return 0;
     }
 
-    LogI("未知内核 '%s': 跳过结果校验(可用 --param 传参数, 用调试器 x 命令或 --fb-out 看内存)",
-         k.c_str());
+    LogW("内核 '%s' 没有内置参考模型: 只跑了内核, **结果未被校验**(可用 --param 传参数, "
+         "再用调试器 x 命令或 --fb-out 看内存)", k.c_str());
     return 0;
 }
 

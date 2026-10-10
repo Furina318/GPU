@@ -13,7 +13,7 @@
 
 namespace simu {
 
-constexpr uint32_t CMD_QUEUE_BASE_DEFAULT = 0x0100'0000;   // CMDS §2.1 / PLAN §3
+constexpr uint32_t CMD_QUEUE_BASE_DEFAULT = 0x0100'0000;   
 constexpr uint32_t CMD_QUEUE_SIZE_DEFAULT = 4096;
 constexpr uint32_t SEM_BASE_DEFAULT       = 0x0300'0000;   // 信号量区(驱动可写 SEM_BASE)
 constexpr uint16_t SEM_NONE               = 0xFFFF;

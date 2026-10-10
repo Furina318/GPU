@@ -69,18 +69,23 @@ def main():
         return 1
 
     print("\n== 汇编镜像 ==")
-    for k in ("clear", "gouraud", "matmul", "anim"):
+    for k in ("clear", "gouraud", "matmul", "anim", "abs"):
         ok, msg = assemble(os.path.join(REPO, "sw/kernels", k + ".S"), os.path.join(OUT, k + ".bin"))
         check("汇编 sw/kernels/%s.S" % k, ok, msg)
-    for f in ("nested7", "spin", "err_align", "err_bar_div", "err_deadlock", "err_recov", "err_mmio"):
+    for f in ("nested7", "spin", "err_align", "err_bar_div", "err_deadlock", "err_recov", "err_mmio",
+              "sh_conflict", "sh_noconflict", "sh_twobank"):
         ok, msg = assemble(os.path.join(HERE, f + ".S"), os.path.join(OUT, f + ".bin"))
         check("汇编 tests/%s.S" % f, ok, msg)
 
     print("\n== 正例: 三个内核结果校验 ==")
-    for k in ("clear", "gouraud", "matmul", "anim"):     # anim 有默认参数块与参考模型(见 main.cpp)
+    for k in ("clear", "gouraud", "matmul", "anim", "abs"):   # anim/abs 有默认参数块与参考模型
         rc, out = run([os.path.join(OUT, k + ".bin")])
         check("%s: 退出码 0 且校验通过" % k, rc == 0 and "校验通过" in out,
               "rc=%d" % rc if rc else out[-300:])
+
+    rc, out = run([os.path.join(OUT, "abs.bin")])
+    check("abs(§7.4): 结果正确且确实发散了(压栈 >0, 栈深 1/8)",
+          rc == 0 and "abs 校验通过" in out and "0 次压栈" not in out and "栈最深 1/8" in out, out[-400:])
 
     print("\n== SIMT 栈: 7 层嵌套发散 ==")
     rc, out = run([os.path.join(OUT, "nested7.bin"), "--warps", "1", "--no-check"])
@@ -262,6 +267,17 @@ def main():
                            "launch 0x20 4 0x%x 300 0xFFFF" % f_clear])
     rc, out = run([clear_bin, "--cp-script", sc, "--no-check"])
     check("signal_id=300(保留区): 校验阶段 CMD_ERROR", rc == 1 and "signal_id" in out, out[-300:])
+
+    print("\n== 访存代价模型: 共享 bank 冲突(守一个真实 bug) ==")
+    # 冲突算式曾对空 bank 也减 1, 把单个 bank 的冲突抵消成 0 ⇒ 冲突代价恒为 0。这三条用例固定住正确语义。
+    rc, out = run([os.path.join(OUT, "sh_conflict.bin"), "--warps", "1", "--no-check"])
+    check("8 lane 同 bank 异地址: +7 拍(未修正时是 0 拍/4 周期)",
+          "bank 冲突额外 7 拍" in out and "周期     : 10" in out, out[-300:])
+    rc, out = run([os.path.join(OUT, "sh_noconflict.bin"), "--warps", "1", "--no-check"])
+    check("8 lane 落 8 个 bank: 0 冲突、4 周期", "bank 冲突额外 0 拍" in out and "周期     : 4" in out, out[-300:])
+    rc, out = run([os.path.join(OUT, "sh_twobank.bin"), "--warps", "1", "--no-check"])
+    check("2 个非空 bank 各 2 个地址: +2 拍(旧算式算成 -4 ⇒ 0)",
+          "bank 冲突额外 2 拍" in out, out[-300:])
 
     print("\n== ⑧ SIMT 栈: 独立模型(按 §2.3.3 从零实现) vs C++ 模拟器 ==")
     p2 = subprocess.run([sys.executable, os.path.join(HERE, "stack_model_check.py")],

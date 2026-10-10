@@ -68,15 +68,21 @@ check: $(BUILD)/simulator $(IMAGES)
 	@fail=0; for k in $(ALL_KERNELS); do \
 		printf '%-10s ' $$k; \
 		if $(BUILD)/simulator $(BUILD)/$$k.bin >$(BUILD)/$$k.log 2>&1; then \
-			sed -n 's/.*\(校验通过.*\)/\1/p' $(BUILD)/$$k.log | head -1; \
+			if grep -q '校验通过' $(BUILD)/$$k.log; then \
+				sed -n 's/.*\(校验通过.*\)/\1/p' $(BUILD)/$$k.log | head -1; \
+			else \
+				echo "⚠ 跑通但没有参考模型(结果未校验)"; \
+			fi; \
 		else \
 			echo "✗ 失败(退出码 $$?), 详见 $(BUILD)/$$k.log"; fail=1; \
 		fi; \
 	done; \
 	echo; if [ $$fail -eq 0 ]; then echo "全部内核通过"; else echo "有内核失败"; exit 1; fi
 
-## make test → 回归测试: 内核正例 + ISA §2.6 错误路径 + 运行模式 + 动画 demo
+## make test → 回归测试: 文档一致性 + ISA 表三方对照 + ISA §2.6 错误路径 + 运行模式 + 动画 demo
 test: $(BUILD)/simulator $(BUILD)/anim
+	python3 tests/doc_consistency_check.py
+	python3 tests/isa_ref_check.py
 	python3 tests/stack_model_check.py
 	python3 tests/run_tests.py
 

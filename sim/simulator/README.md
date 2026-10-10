@@ -4,7 +4,7 @@
 MMIO、信号量)真正**跑起来**的 C++17 程序。它有两个用途:
 
 1. **调试**: 单步看每一条指令怎么改 lane 掩码、SIMT 栈怎么压/弹、共享内存怎么被 8 个 lane 写。
-2. **将来 RTL 的对照物**: 分层回归金字塔(PLAN.md §11)里的"模块级 golden model" —— 同一份内核镜像,
+2. **将来 RTL 的对照物**: 分层回归金字塔里的"模块级 golden model" —— 同一份内核镜像,
    RTL 与这里的**逐元素**(而不是只看第 0 行)结果必须一致。
 
 ```
@@ -19,7 +19,7 @@ make anim DEMO_ARGS="--ascii"     # 动画 demo(sw/demo/anim.cpp, 见 sw/demo/RE
 
 构建产物:`build/libsimu.a`(除命令行前端外的全部源码)+ `build/simulator` + `build/anim`。
 库的形式是为了让 `sw/demo/` 里的 **host 驱动**能直接链接同一套 Machine/CP API —— 也就是
-PLAN.md §11"系统级: host 驱动走完整流程: 写命令 → 引擎执行 → 读回验证"。
+host 驱动走完整流程: 写命令 → 引擎执行 → 读回验证"。
 
 ## 1. 三种运行方式
 
@@ -115,6 +115,10 @@ trace on|off     q 退出
 
 - **周期是"发射模型"不是时序仿真**: 每 SM 每周期发射 1 条(ISA §8.1)、div/rem 多周期占用、
   共享内存同 bank 异地址串行化 —— 后两条文档没给数值,是模拟器的假设(启动时打印)。
+  访存的具体计费:**每条 warp 级 ld/st 只占 1 个发射槽,与它跨几行/几次请求无关**(合并度只统计在
+  `访存` 一行的"32B 行请求"里,不折算成拍数);共享同 bank 异地址按 `Σ(非空 bank 的不同地址数 − 1)`
+  加占用拍数,这条语义由 `tests/sh_conflict.S` / `sh_twobank.S` / `sh_noconflict.S` 三个用例守着
+  (v0.3 修过一个 bug:空 bank 也减 1,把单个 bank 的冲突抵消成 0)。
   它回答"指令数/占用槽/是否被 barrier 卡住",不回答"综合出来多少 MHz"。
 - **没有建模**: cache/写缓冲/延迟、2D 引擎(命令按 `length_words` 跳过)、FP16 与重量化 GEMM。
 - **架构错误一律硬停**(ISA §2.6): 非法指令、未对齐访存、发散下的 `bar.sync`、缺 `ipdom` 的发散、
@@ -122,9 +126,10 @@ trace on|off     q 退出
 
 ## 8. 测试
 
-`make test` 会跑 `tests/run_tests.py`(37 项)+ `tests/stack_model_check.py`:
+`make test` 会跑 `tests/run_tests.py`(65 项)+ `tests/stack_model_check.py`:
 
-- **正例**: clear/gouraud/matmul 结果校验 + 与 Python 参考模型逐元素比对;
+- **文档一致性**: `tests/isa_ref_check.py` —— ISA.md §5 的指令表 ↔ 汇编器 ↔ 译码器三方对照 + 位域往返
+- **正例**: clear/gouraud/matmul/abs/anim 结果校验 + 与独立参考模型逐元素比对(abs 是 §7.4 的逐 lane 条件内核,实测 4 次压栈/8 次收敛);
   7 层嵌套发散(`tests/nested7.S`)检验 SIMT 栈(LIFO、每帧一次切路径 + 一次弹栈)
 - **反例**: `BAD_ALIGN` / `BAR_DIVERGENT` / `ERR_NO_RECOV` / `ILLEGAL_INSTR` / barrier 死锁 /
   `LAUNCH_REJECT` / CRC 不符 / `SIMT_OVF` 的不可达性论证

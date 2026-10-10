@@ -139,9 +139,9 @@ def main():
     os.makedirs(os.path.join(SIMDIR, "build", "tests"), exist_ok=True)   # make clean 会删掉 build/
     cases = ["nested7.S", "err_bar_div.S", "err_deadlock.S"]
     # abs 内核(§7.4)也在仓库里, 顺手一起比
-    abs_src = os.path.join(REPO, "sw", "kernels", "abs.S")   # 若存在则一并比
-    if os.path.exists(abs_src):
-        cases.append(abs_src)
+    # 注意: sw/kernels/abs.S 不放进这里 —— 它的分支条件来自 ld.g 读到的数据,
+    # 而这个模型只模拟控制流(不模拟内存),要覆盖它就得把数据通路也建进来。
+    # abs 的发散行为由 run_tests.py 断言(实测 4 次压栈 / 8 次收敛 / 栈深 1)。
     ok = True
     print("SIMT 栈模型(§2.3.3 独立实现) vs C++ 模拟器:")
     for c in cases:

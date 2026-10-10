@@ -694,11 +694,14 @@ bool Machine::execute_one(Warp& w, const DecodedInst& d, uint32_t& next_pc, uint
 
         // 合并度 / bank 冲突统计
         if (d.is_shared) {
+            // 每个 bank 这一拍要服务的**不同地址**数;每个 bank 串行服务 1 个地址 ⇒ 额外拍数 = Σ(不同地址数 − 1),
+            // 只对非空 bank 求和(空 bank 不能减 1,否则单个 bank 的冲突会被空 bank 抵消成 0)
             std::set<uint32_t> per_bank[8];
             for (int l = 0; l < WARP_SIZE; ++l)
                 if (eff >> l & 1) per_bank[(addr[l] >> 2) & 7].insert(addr[l]);
             int conflicts = 0;
-            for (int b = 0; b < 8; ++b) conflicts += int(per_bank[b].size()) - 1;
+            for (int b = 0; b < 8; ++b)
+                if (!per_bank[b].empty()) conflicts += int(per_bank[b].size()) - 1;
             if (conflicts > 0 && model.shared_conflicts) {
                 extra = uint32_t(conflicts);
                 stats.shared_extra_cycles += uint64_t(conflicts);

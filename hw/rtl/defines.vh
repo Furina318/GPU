@@ -66,4 +66,17 @@
 `define MMIO_2D_STATUS      8'h68
 `define MMIO_2D_ERROR       8'h6c
 
+
+
+`define UNUSED_VAR(x)   /* verilator lint_off GENUNNAMED */ \
+                        if (1) begin \
+                            /* verilator lint_off UNUSED */ \
+                            logic [$bits(x)-1:0] __unused = x; \
+                            /* verilator lint_on UNUSED */ \
+                        end \
+                        /* verilator lint_on GENUNNAMED */
+
+`define UNUSED_PIN(x)   /* verilator lint_off PINCONNECTEMPTY */ \
+                        . x () \
+
 `endif // DEFINES_VH

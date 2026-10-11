@@ -15,13 +15,13 @@ module regfile (
 
     input  wire [`CLOG_PRED-1:0] pred_wr_addr,
     input  wire                  pred_wr_en  ,
-    input  wire [ `NUM_PRED-1:0] pred_wr_data,
+    input  wire                  pred_wr_data,
     input  wire [`CLOG_PRED-1:0] pred_rd_addr,
-    output wire [ `NUM_PRED-1:0] pred_rd_data
+    output wire                  pred_rd_data
 );
 
-    reg [31:0] gpr[`NUM_GPR-1:0];
-    reg [ 3:0] pred[`NUM_PRED-1:0];
+    reg [31:0] gpr [ `NUM_GPR-1:0];
+    reg        pred[`NUM_PRED-1:0];
 
     always_ff @(posedge clk) begin
         // 使用之前一定会先写入
@@ -35,8 +35,8 @@ module regfile (
         end
     end
 
-    assign gpr_rs1_data = (|gpr_rs1_addr) ? gpr[gpr_rs1_addr] : `NUM_GPR'(0);
-    assign gpr_rs2_data = (|gpr_rs2_addr) ? gpr[gpr_rs2_addr] : `NUM_GPR'(0);
-    assign pred_rd_data = (|pred_rd_addr) ? pred[pred_rd_addr] : `NUM_PRED'(0);
+    assign gpr_rs1_data = (|gpr_rs1_addr) ? gpr[gpr_rs1_addr]  : `NUM_GPR'(0);
+    assign gpr_rs2_data = (|gpr_rs2_addr) ? gpr[gpr_rs2_addr]  : `NUM_GPR'(0);
+    assign pred_rd_data = (|pred_rd_addr) ? pred[pred_rd_addr] : 1'b1;
 
 endmodule

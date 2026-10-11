@@ -171,7 +171,7 @@ static Profile profile_for(const std::string& k, int warps_override, int fb_w, i
     p.warps = 4;
     if (k == "clear") {
         p.params[0] = fb_w * fb_h;              // N = 像素数
-        p.params[4] = 0xFF00FF00u;             // color = RGBA8888
+        p.params[4] = 0xFF00FF00u;             // color = ARGB8888(不透明绿)
         p.params[8] = 0;                       // stride_elems, 下面按 warps*8 填(驱动契约)
     } else if (k == "gouraud") {
         p.params[0]  = 0x1000'0000u;           // in_base(顶点输入缓冲)
@@ -199,6 +199,34 @@ static Profile profile_for(const std::string& k, int warps_override, int fb_w, i
         p.params[28] = 0xFF102040u;                 // bg0
         p.params[32] = 0xFF2060A0u;                 // bg1
         p.params[36] = 0xFFFFC040u;                 // box_color
+    } else if (k == "car_vtx") {               // 小车 demo 的顶点内核: 6 个顶点 = 2 个三角形
+        p.warps = 1;                           // 只有 6 个 lane 有活干
+        p.params[0]  = 0x1000'0000u;           // vtx_base
+        p.params[4]  = fbits(24.0f);           // car_x
+        p.params[8]  = fbits(12.0f);           // car_y
+        p.params[12] = fbits(40.0f);           // body_w
+        p.params[16] = fbits(18.0f);           // body_h
+        p.params[20] = fbits(0.25f);           // shear(高光随手绘轮廓倾斜)
+        p.params[24] = fbits(0.75f); p.params[28] = fbits(0.90f);   // 顶边 rgba
+        p.params[32] = fbits(1.00f); p.params[36] = fbits(0.35f);
+        p.params[40] = fbits(0.30f); p.params[44] = fbits(0.55f);   // 底边 rgba
+        p.params[48] = fbits(0.95f); p.params[52] = fbits(0.15f);
+    } else if (k == "car") {                   // 逐像素版(sw/kernels/car.S): 128x64 画布上的小场景
+        p.warps = 4;
+        p.params[0]  = 128u * 64u;             // N
+        p.params[4]  = uint32_t(p.warps * WARP_SIZE);   // stride_elems(驱动契约)
+        p.params[8]  = 0x1000'0000u;           // fb_base
+        p.params[12] = 16;                     // car_x
+        p.params[16] = 26;                     // car_y
+        p.params[20] = 127;                    // W_mask
+        p.params[24] = 7;                      // H_shift = log2(128)
+        p.params[28] = 0x8000'0000u;           // sprite_base
+        p.params[32] = 24; p.params[36] = 12;  // sprite_w/h
+        p.params[40] = 0xFF1E4A1Eu;            // grass
+        p.params[44] = 0xFF4A4A4Au;            // road
+        p.params[48] = 0xFFD8D8D8u;            // dash
+        p.params[52] = 20; p.params[56] = 24;  // road_top/h
+        p.params[60] = 31; p.params[64] = 2;   // dash_y/h
     } else if (k == "matmul") {
         p.params[0]  = 0x1000'0000u;           // a_base(A 列主序, M×K)
         p.params[4]  = 0x1000'1000u;           // b_base(B 行主序, K×N)
@@ -309,6 +337,66 @@ static int check_result(Machine& m, const std::string& k, const std::map<uint32_
             return 3;
         }
         LogI("gouraud 校验通过: %u 个顶点的仿射变换与颜色透传全部按位一致", N);
+        return 0;
+    }
+
+    if (k == "car_vtx") {
+        const uint32_t base = gp(0, 0x1000'0000u);
+        const float cx = as_fp(gp(4, 0)), cy = as_fp(gp(8, 0));
+        const float bw = as_fp(gp(12, 0)), bh = as_fp(gp(16, 0)), sh = as_fp(gp(20, 0));
+        const float top[4] = {as_fp(gp(24, 0)), as_fp(gp(28, 0)), as_fp(gp(32, 0)), as_fp(gp(36, 0))};
+        const float bot[4] = {as_fp(gp(40, 0)), as_fp(gp(44, 0)), as_fp(gp(48, 0)), as_fp(gp(52, 0))};
+        // 三角形列表顺序, 与 car_vtx.S 的 dx/dy 选取规则一一对应
+        const int DX[6] = {0, 1, 0, 1, 1, 0}, DY[6] = {0, 0, 1, 0, 1, 1};
+        uint32_t bad = 0, first = 0;
+        for (int i = 0; i < 6; ++i) {
+            const float dx = DX[i] ? bw : 0.0f, dy = DY[i] ? bh : 0.0f;
+            // 与内核相同的运算顺序: fma(shear, dy, dx) 再 + car_x(单次舍入的 fma)
+            const float xe = std::fma(sh, dy, dx) + cx;
+            const float ye = dy + cy;
+            const float* c = DY[i] ? bot : top;
+            bool ok = rd(m, base + uint32_t(i) * 24) == fbits(xe) &&
+                      rd(m, base + uint32_t(i) * 24 + 4) == fbits(ye);
+            for (int j = 0; j < 4 && ok; ++j)
+                ok = rd(m, base + uint32_t(i) * 24 + 8 + uint32_t(j) * 4) == fbits(c[j]);
+            if (!ok) { if (!bad) first = i; ++bad; }
+        }
+        if (bad) {
+            LogE("car_vtx 校验失败: %u/6 个顶点不符; 首个顶点 %d", bad, int(first));
+            return 3;
+        }
+        LogI("car_vtx 校验通过: 6 个顶点(x'=fma(shear,dy,dx)+car_x)与颜色选择全部按位一致");
+        return 0;
+    }
+
+    if (k == "car") {                          // 逐像素版: 背景公式 + 精灵颜色键合成
+        const uint32_t N = gp(0, 128u * 64u), fb = gp(8, 0x1000'0000u);
+        const uint32_t carx = gp(12, 16), cary = gp(16, 26);
+        const uint32_t wmask = gp(20, 127), hshift = gp(24, 7);
+        const uint32_t spr = gp(28, 0x8000'0000u), sw = gp(32, 24), sh = gp(36, 12);
+        const uint32_t grass = gp(40, 0xFF1E4A1Eu), road = gp(44, 0xFF4A4A4Au), dash = gp(48, 0xFFD8D8D8u);
+        const uint32_t rtop = gp(52, 20), rh = gp(56, 24), dtop = gp(60, 31), dh = gp(64, 2);
+        uint32_t bad = 0, first = 0;
+        // 与内核相同的逐像素公式(注意: 判断用无符号减法, 与 ISA 的 setp.ltu 一致)
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t x = i & wmask, y = i >> hshift;
+            uint32_t want = grass;
+            if ((y - rtop) < rh) want = road;
+            if (((y - dtop) < dh) && (((x >> 3) & 1u) != 0)) want = dash;
+            const uint32_t dx = x - carx, dy = y - cary;
+            if (dy < sh && dx < sw) {
+                const uint32_t pix = rd(m, spr + (dy * sw + dx) * 4);
+                if (pix != 0) want = pix;      // 0 = 透明键 ⇒ 保留背景
+            }
+            if (rd(m, fb + i * 4) != want) { if (!bad) first = i; ++bad; }
+        }
+        if (bad) {
+            LogE("car 校验失败: %u/%u 个像素不符; 首个 idx=%u (x=%u y=%u) 期望 0x%08x 得到 0x%08x",
+                 bad, N, first, first & wmask, first >> hshift, 0u, rd(m, fb + first * 4));
+            return 3;
+        }
+        LogI("car 校验通过: %u 个像素与逐像素参考公式一致(背景 + 精灵颜色键; stride_elems=%u)",
+             N, gp(4, 32));
         return 0;
     }
 
@@ -512,6 +600,10 @@ static void print_report(Machine& m, CommandProcessor& cp) {
     if (s.unmapped_access)
         std::printf("              已知内存区之外的访问 %llu 次(驱动自分配缓冲属正常)\n",
                     (unsigned long long)s.unmapped_access);
+    std::printf("   2D 引擎  : %s(状态 0x%x, 错误 %s, 待落盘 %d 字) FB %ux%u fmt=%u stride=%u\n",
+                gfx_err_name(cp.gfx().error_code()), cp.gfx().status(),
+                gfx_err_name(cp.gfx().error_code()), cp.gfx().rop_pending(),
+                cp.gfx().fb_w(), cp.gfx().fb_h(), cp.gfx().fb_fmt(), 0u);
     std::printf("   状态     : SM_DONE=0x%x SM_KERNEL_MASK=0x%x SM0_ERROR=%s SM1_ERROR=%s CP_ERROR=%s IRQ=0x%x\n",
                 m.mmio_read(MMIO_SM_DONE), m.mmio_read(MMIO_SM_KERNEL_MASK), sm_err_name(m.sm[0].error),
                 sm_err_name(m.sm[1].error), cp_err_name(cp.error()), cp.irq_status());
@@ -594,6 +686,9 @@ static bool run_cp_script(CommandProcessor& cp, Machine& gpu, const std::string&
         while (is >> w) tok.push_back(w);
         if (tok.empty()) continue;
         auto num = [&](size_t i) { return uint32_t(std::strtoul(tok[i].c_str(), nullptr, 0)); };
+        // 2D 命令行末尾可跟 signal_id / wait_id(GFX.md §7.1: wait_id 用来等 LAUNCH 完成)
+        auto sig_of  = [&](size_t i) { return i < tok.size() ? uint16_t(num(i)) : SEM_NONE; };
+        auto wait_of = [&](size_t i) { return i < tok.size() ? uint16_t(num(i)) : SEM_NONE; };
         const std::string& c = tok[0];
         bool r = true;
         if (c == "nop" && tok.size() >= 2)                                  r = cp.submit_nop(num(1), err);
@@ -619,6 +714,28 @@ static bool run_cp_script(CommandProcessor& cp, Machine& gpu, const std::string&
             for (int i = 0; i < 16; ++i) d[i] = num(size_t(i + 1));
             r = cp.submit_gemm(d, err);
         }
+        else if (c == "mem" && tok.size() >= 3) {   // host 写全局内存(驱动自分配缓冲: 顶点/纹理/源图)
+            for (size_t i = 2; i < tok.size(); ++i) gpu.mem.st_global(num(1) + uint32_t(i - 2) * 4u, num(i));
+            LogI("host 写内存 0x%08x 起 %zu 字", num(1), tok.size() - 2);
+            continue;
+        }
+        else if (c == "setreg" && tok.size() >= 3)                           r = cp.submit_2d(GFX_CMD_SET_REG, {num(1), num(2)}, sig_of(3), wait_of(4), err);
+        else if (c == "flush")                                              r = cp.submit_2d(GFX_CMD_FLUSH, {}, sig_of(1), wait_of(2), err);
+        else if (c == "fill" && tok.size() >= 7)
+            r = cp.submit_2d(GFX_CMD_FILL,
+                             {num(1), num(2), num(3) | (num(4) << 16), num(5) | (num(6) << 16)},
+                             sig_of(7), wait_of(8), err);
+        // blit <src> <dst> <src_stride> <x> <y> <w> <h> <flags> <colkey> [signal_id] [wait_id]
+        else if (c == "blit" && tok.size() >= 10)
+            r = cp.submit_2d(GFX_CMD_BLIT,
+                             {num(1), num(2), num(3), num(4) | (num(5) << 16),
+                              num(6) | (num(7) << 16), num(8), num(9)},
+                             sig_of(10), wait_of(11), err);
+        // draw <vtx_addr> <vtx_count> <flags> [signal_id] [wait_id]
+        // word4 = vtx_format(0 = 6×f32) | prim(0 = 三角形列表), word5 = flags(GFX.md §4.3)
+        else if (c == "draw" && tok.size() >= 4)
+            r = cp.submit_2d(GFX_CMD_DRAW, {num(1), num(2), 0, num(3), 0, 0},
+                             sig_of(4), wait_of(5), err);
         else if (c == "mmio" && tok.size() >= 3) {   // host 直接写 MMIO(与 WRITE_REG 等价, CMDS §6.2/§7)
             const uint32_t a2 = num(1);
             if (a2 >= MMIO_END) { *err = "MMIO 偏移越界"; r = false; }
@@ -837,7 +954,7 @@ int main(int argc, char** argv) {
 
     if (!o.fb_out.empty()) {
         if (write_ppm(o.fb_out, gpu, o.fb_w, o.fb_h))
-            LogI("帧缓冲已导出: %s (%dx%d, 基址 0x%08x, RGBA8888 → RGB)",
+            LogI("帧缓冲已导出: %s (%dx%d, 基址 0x%08x, ARGB8888 → RGB)",
                  o.fb_out.c_str(), o.fb_w, o.fb_h, gpu.fb_base);
         else
             LogE("写 PPM 失败: %s", o.fb_out.c_str());

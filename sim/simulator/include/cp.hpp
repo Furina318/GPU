@@ -1,9 +1,10 @@
 #pragma once
 
 // CP(命令处理器): 命令环 → 校验(CMDS §2.4)→ 执行 → 依赖/信号量 → 完成判定(§4.3)。
-// shader 核在 machine.hpp;这里只做"命令流"这一层,以及矩阵引擎的 v1(§6.11)。
+// shader 核在 machine.hpp(shader/);矩阵引擎的 v1 与 2D 引擎(2D-engine/)由本类驱动。
 
 #include "config.hpp"
+#include "gfx2d.hpp"
 #include "machine.hpp"
 
 #include <cstdint>
@@ -22,10 +23,13 @@ constexpr uint16_t SEM_NONE               = 0xFFFF;
 enum class CpErr : uint32_t {
     NO_ERROR = 0, CMD_ERROR = 1, LAUNCH_REJECT = 2, BUS_ERROR = 3,
     TIMEOUT = 4, ILLEGAL_STATE = 5, STALE_SM_ERROR = 6,
-    // 7..15 是文档保留区, 这里占 7 并在 CMDS §8.1 表里登记:
+    // 7..15 是文档保留区, 这里占 7 与 8 并在 CMDS §8.1 表里登记:
     // SM 架构错误本身没有 CP 错误码(权威信息在 SM*_ERROR/FAULT_PC, §8.3), 但 §4.3 要求
     // "任一 SM 出错 ⇒ 置 CP_ERROR", 所以需要一个取值把 CP 标成错误态。
     SM_FAULT = 7,
+    // 引擎(2D)命令失败: 细节在引擎自己的错误寄存器(2D_ERROR), CP 只标记"有引擎失败过"
+    // —— 与 SM_FAULT 对称, 见 GFX.md §7.3。
+    ENGINE_FAULT = 8,
 };
 const char* cp_err_name(CpErr e);
 const char* cmd_opcode_name(uint8_t opcode);
@@ -50,7 +54,8 @@ struct CmdInfo {
 
 class CommandProcessor {
 public:
-    explicit CommandProcessor(Machine& m) : machine_(m) { machine_.attach_cp(this); }
+    explicit CommandProcessor(Machine& m)
+        : machine_(m), gfx_(m.mem, &m.fb_base, &m.fb_size) { machine_.attach_cp(this); }
 
     // ── 驱动侧: 往环形队列里追加命令 ──
     bool submit(const std::vector<uint32_t>& words, std::string* err);
@@ -66,9 +71,19 @@ public:
     bool submit_irq(uint8_t irq_id, std::string* err);
     bool submit_params(uint32_t dst_off, const std::vector<uint32_t>& params, std::string* err);
     bool submit_gemm(const uint32_t desc[16], std::string* err);
+    // 2D 命令(GFX.md §4): params 是 word2 起的参数,长度由 opcode 决定
+    bool submit_2d(uint8_t opcode, const std::vector<uint32_t>& params,
+                   uint16_t signal_id, uint16_t wait_id, std::string* err);
 
     // 驱动写完 tail 后写 DOORBELL(CMDS §2.1);这里等价于直接触发处理
     void doorbell();
+
+    // 驱动契约(CMDS §2 / SPEC §2): 每条命令补齐到 N 字节边界(N 必须是 4 的倍数且 ≤ 环大小)。
+    // 补齐用一条 NOP 命令 ⇒ 每条命令之后 tail 都落在边界上, 环回绕时就永远有 ≥ 一个完整块的
+    // 空间可以填 NOP(§6.1 要求 NOP ≥ 2 字 ⇒ 剩 4 字节时没有任何合法填法)。
+    // 默认 0 = 不补齐(CP 自己的边界测试要精确控制队列占用)。
+    void set_submit_pad(uint32_t bytes) { submit_pad_ = (bytes >= 8 && (bytes & 3u) == 0) ? bytes : 0; }
+    uint32_t submit_pad() const { return submit_pad_; }
 
     // 处理队列: run_kernels=false 时遇到 LAUNCH 就停下(内核交给调试器单步)
     int  process(bool run_kernels, std::string* err);
@@ -103,6 +118,10 @@ public:
 
     const std::vector<CmdInfo>& history() const { return history_; }
 
+    // 2D 引擎(GFX.md): 状态/错误经 MMIO 0x68/0x6C 暴露, 这里给参考模型与测试直接访问
+    Gfx2D&       gfx() { return gfx_; }
+    const Gfx2D& gfx() const { return gfx_; }
+
     // 矩阵引擎
     uint32_t gemm_status() const;
     uint32_t gemm_error() const { return gemm_error_; }
@@ -122,6 +141,7 @@ private:
     bool     exec_load_kernel(const uint32_t* w);
     bool     exec_launch(const uint32_t* w, CmdInfo& ci);
     bool     exec_gemm(const uint32_t* w, CmdInfo& ci);
+    bool     exec_2d(uint8_t opcode, CmdInfo& ci, const uint32_t* w);
     bool     queue_full_for(uint32_t bytes);
     bool     complete_launch(std::string* err);
     void     set_irq(uint32_t bit);
@@ -143,9 +163,11 @@ private:
     uint32_t   pending_signal_ = SEM_NONE;
     uint32_t   pending_addr_ = 0;
     uint64_t   cmds_done_ = 0;
+    uint32_t   submit_pad_ = 0;        // 驱动侧命令补齐粒度(见 set_submit_pad)
     std::vector<CmdInfo> history_;
 
     std::function<void()> launch_hook_;
+    Gfx2D      gfx_;                 // 2D 引擎(GFX.md): 与 machine_.fb_base/fb_size 共享帧缓冲几何
     bool       gemm_busy_ = false, gemm_done_ = false;
     uint32_t   gemm_error_ = 0;
     uint64_t   gemm_ops_ = 0;

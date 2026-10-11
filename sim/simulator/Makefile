@@ -1,5 +1,9 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
+# 头文件依赖跟踪(-MMD 生成 .d, 末尾 -include 进来): **没有它, 改了头文件只会重编对应的 .cpp**,
+# 于是"新 cp.o + 旧 main.o"这种 ABI 不一致的可执行文件会被悄悄链出来(表现为随机段错误)。
+DEPFLAGS := -MMD -MP
+SRCDIRS  := src shader 2D-engine
 BUILD    := build
 OBJDIR   := $(BUILD)/obj
 
@@ -14,7 +18,7 @@ IMAGES   := $(addprefix $(BUILD)/,$(addsuffix .bin,$(ALL_KERNELS)))
 HAVE_SDL   ?= $(shell pkg-config --exists sdl2 2>/dev/null && echo 1)
 SDL_CFLAGS := $(if $(HAVE_SDL),$(shell pkg-config --cflags sdl2 2>/dev/null))
 SDL_LIBS   := $(if $(HAVE_SDL),$(shell pkg-config --libs sdl2 2>/dev/null))
-SRCS       := $(wildcard src/*.cpp)
+SRCS       := $(wildcard $(addsuffix /*.cpp,$(SRCDIRS)))
 ifeq ($(HAVE_SDL),1)
   CXXFLAGS += -DSIMU_HAVE_SDL $(SDL_CFLAGS)
 else
@@ -25,11 +29,11 @@ LDLIBS   += $(SDL_LIBS)
 # 模拟器本体做成静态库(libsimu.a): 除了命令行前端(main.cpp)之外的源码都进去,
 # 这样 sw/demo/ 里的 host 驱动可以直接链接同一套 Machine/CP API。
 LIB_SRCS := $(filter-out src/main.cpp,$(SRCS))
-LIB_OBJS := $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
+LIB_OBJS := $(patsubst %.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
 DEMOS     := anim car
 DEMO_BINS := $(addprefix $(BUILD)/,$(DEMOS))
 
-.PHONY: all run run-all debug dbg-all check test images demo anim clean help
+.PHONY: all run run-all debug dbg-all check test images demo anim car car-shader clean help
 
 all: $(BUILD)/simulator $(DEMO_BINS)
 
@@ -56,8 +60,13 @@ debug dbg: $(BUILD)/simulator $(BUILD)/$(KERNEL).bin
 anim: $(BUILD)/anim $(BUILD)/anim.bin
 	$(BUILD)/anim --image $(BUILD)/anim.bin $(DEMO_ARGS)
 
-car: $(BUILD)/car $(BUILD)/car.bin
-	$(BUILD)/car --image $(BUILD)/car.bin $(DEMO_ARGS)
+## make car        → 2D 引擎路径(FILL/BLIT/DRAW, 默认)
+## make car-shader → 逐像素 shader 路径(sw/kernels/car.S), 与上面画同一幅画
+car: $(BUILD)/car $(BUILD)/car.bin $(BUILD)/car_vtx.bin
+	$(BUILD)/car $(DEMO_ARGS)
+
+car-shader: $(BUILD)/car $(BUILD)/car.bin
+	$(BUILD)/car --shader $(DEMO_ARGS)
 
 ## make demo → 只编译(不运行), 便于单独调
 demo: $(DEMO_BINS)
@@ -80,7 +89,7 @@ check: $(BUILD)/simulator $(IMAGES)
 	echo; if [ $$fail -eq 0 ]; then echo "全部内核通过"; else echo "有内核失败"; exit 1; fi
 
 ## make test → 回归测试: 文档一致性 + ISA 表三方对照 + ISA §2.6 错误路径 + 运行模式 + 动画 demo
-test: $(BUILD)/simulator $(BUILD)/anim
+test: $(BUILD)/simulator $(BUILD)/anim $(BUILD)/car $(BUILD)/car.bin $(BUILD)/car_vtx.bin
 	python3 tests/doc_consistency_check.py
 	python3 tests/isa_ref_check.py
 	python3 tests/stack_model_check.py
@@ -94,19 +103,23 @@ $(BUILD)/%.bin: ../../sw/kernels/%.S $(ASM) | $(BUILD)
 $(BUILD)/libsimu.a: $(LIB_OBJS)
 	ar rcs $@ $^
 
-$(BUILD)/simulator: $(OBJDIR)/main.o $(BUILD)/libsimu.a
+$(BUILD)/simulator: $(OBJDIR)/src/main.o $(BUILD)/libsimu.a
 	$(CXX) $^ -o $@ $(LDLIBS)
 
 # 通用 demo 规则: sw/demo/<name>.cpp → build/<name>(链接 libsimu.a)。
 $(BUILD)/%: ../../sw/demo/%.cpp $(BUILD)/libsimu.a | $(OBJDIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $(OBJDIR)/demo_$*.o
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $(OBJDIR)/demo_$*.o
 	$(CXX) $(OBJDIR)/demo_$*.o $(BUILD)/libsimu.a -o $@ $(LDLIBS)
 
-$(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(OBJDIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD) $(OBJDIR):
 	mkdir -p $@
 
 clean:
 	rm -rf $(BUILD)
+
+# 头文件依赖(由 -MMD 生成): 放在最后, 首次构建时文件还不存在 ⇒ 用 wildcard + -include 宽容处理
+-include $(wildcard $(OBJDIR)/*.d) $(wildcard $(OBJDIR)/*/*.d)

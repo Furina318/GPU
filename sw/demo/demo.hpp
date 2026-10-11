@@ -53,6 +53,12 @@ struct Spec {
     std::function<std::string(int w, int h)> check_canvas;
     // 每帧参数块: 与内核常量布局一一对应(驱动契约: stride 类参数必须 = warps*8)
     std::function<std::vector<uint32_t>(const FrameCtx&)> params_for;
+    // 每帧的**附加命令**: 在 LAUNCH 之后、WAIT 之前提交。
+    // 它们排在同一队列里 ⇒ 天然"等内核算完顶点再画",
+    // 也应当用 wait_id 显式表达依赖。返回 false ⇒ 报错退出。
+    std::function<bool(simu::CommandProcessor&, const FrameCtx&, std::string*)> extra_cmds;
+    // 内核镜像的替换(命令行没给 --image 时生效): 用于"同一 demo 两种画法"这类开关
+    std::function<std::string()> image_override;
     // 参考模型: 逐像素校验(空 = 不校验)
     std::function<bool(const std::vector<uint32_t>& fb, const std::vector<uint32_t>& params,
                        const FrameCtx&)> verify;
@@ -74,6 +80,7 @@ struct Options {
     int      w = 0, h = 0, warps = 0, frames = 0, fps = 0, scale = 0;
     int      ascii_cols = 64, ascii_rows = 32;
     bool     view = false, ascii = false, stats = false, quiet = false, verify = true;
+    bool     image_given = false;      // 用户显式给了 --image(此时 spec.image_override 不生效)
     std::string ppm_dir, log_file;
     simu::LogLevel log_level = simu::LogLevel::DEBUG;
     bool     help = false;
@@ -113,7 +120,7 @@ inline bool parse_args(int argc, char** argv, const Spec& spec, Options& o) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "-h" || a == "--help") { o.help = true; return true; }
-        else if (a == "--image"     ) { if (!need(i, "--image"     )) return false; o.image      = argv[++i]; }
+        else if (a == "--image"     ) { if (!need(i, "--image"     )) return false; o.image      = argv[++i]; o.image_given = true; }
         else if (a == "--w"         ) { if (!need(i, "--w"         )) return false; o.w          = std::atoi(argv[++i]); }
         else if (a == "--h"         ) { if (!need(i, "--h"         )) return false; o.h          = std::atoi(argv[++i]); }
         else if (a == "--warps"     ) { if (!need(i, "--warps"     )) return false; o.warps      = std::atoi(argv[++i]); }
@@ -185,6 +192,10 @@ inline int run(int argc, char** argv, const Spec& spec) {
     o.frames = spec.frames; o.fps = spec.fps; o.scale = spec.scale;
     if (!detail::parse_args(argc, argv, spec, o)) { detail::usage(argv[0], spec); return 1; }
     if (o.help) { detail::usage(argv[0], spec); return 0; }
+    if (spec.image_override && !o.image_given) {          // demo 自己决定镜像(如 --shader 切到旧内核)
+        const std::string alt = spec.image_override();
+        if (!alt.empty()) o.image = alt;
+    }
     if (spec.check_canvas) {
         const std::string why = spec.check_canvas(o.w, o.h);
         if (!why.empty()) { std::fprintf(stderr, "%s(当前 %dx%d)\n", why.c_str(), o.w, o.h); return 1; }
@@ -199,6 +210,7 @@ inline int run(int argc, char** argv, const Spec& spec) {
 
     Machine gpu;
     CommandProcessor cp(gpu);
+    cp.set_submit_pad(64);      // 驱动契约: 每条命令补到 64B 边界(CMDS §2 / SPEC §2)
     gpu.model.div_cost = 8;
     std::string err;
 
@@ -267,6 +279,8 @@ inline int run(int argc, char** argv, const Spec& spec) {
         const std::vector<uint32_t> params = spec.params_for(ctx);
         if (params.empty() || !cp.submit_params(0, params, &err) ||
             !cp.submit_launch(entry, uint32_t(o.warps), flags, 0, SEM_NONE, &err) ||
+            // 附加命令(2D 引擎等): 排在 LAUNCH 之后 ⇒ 内核算完顶点它们才会被执行
+            (spec.extra_cmds && !spec.extra_cmds(cp, ctx, &err)) ||
             !cp.submit_wait(cp.sem_base(), frame + 1, &err)) {
             std::fprintf(stderr, "第 %u 帧提交命令失败: %s\n", frame, err.c_str());
             return 1;

@@ -36,6 +36,14 @@ def run(args, stdin=None, timeout=120):
     return p.returncode, p.stdout + p.stderr
 
 
+def write_script(outdir, name, lines):
+    """把命令脚本写到 build/tests/<name>.txt(CP/2D 的边界用例靠它定义整条命令流)。"""
+    path = os.path.join(outdir, name + ".txt")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
 def assemble(src, out):
     p = subprocess.run([sys.executable, ASM, src, "--format", "image", "-o", out],
                        capture_output=True, text=True)
@@ -337,6 +345,189 @@ def main():
     check("matmul: 1024 个 C 元素与 Python 参考逐位一致",
           len(vals) == 1024 and all(abs(a - b) < 1e-6 for a, b in zip(vals, exp)),
           "读到 %d 个元素" % len(vals))
+
+    print("\n== ⑪ 2D 引擎(GFX.md): 与独立 Python 参考模型逐像素对拍 ==")
+    REF2D = os.path.join(HERE, "gfx2d_ref.py")
+    FB = 0x1000_0000
+    W = H = 64
+    PX = W * H
+
+    def gfx_case(name, lines, fb_base=FB, preload=None, extra_args=None, img=None):
+        """把同一份命令脚本喂给模拟器与 Python 参考模型, 逐像素比较帧缓冲。"""
+        script = write_script(OUT, "gfx_%s" % name, lines)
+        got = os.path.join(OUT, "gfx_%s_sim.txt" % name)
+        exp = os.path.join(OUT, "gfx_%s_ref.txt" % name)
+        args = [img or os.path.join(OUT, "clear.bin"), "--cp-script", script, "--no-check", "--quiet",
+                "--dump", "0x%08x,%d,%s" % (fb_base, PX, got)] + list(extra_args or [])
+        rc, out = run(args)
+        cmd = [sys.executable, REF2D, "--script", script, "--fb-base", "0x%08x" % fb_base,
+               "--fb-words", str(PX), "--out", exp]
+        for addr, path in (preload or []):
+            cmd += ["--preload", addr, path]
+        p2 = subprocess.run(cmd, capture_output=True, text=True)
+        if rc != 0 or p2.returncode != 0 or not os.path.exists(got):
+            check("2D %s: 运行成功" % name, False, (out + p2.stdout + p2.stderr)[-300:])
+            return None, None
+        a = [int(l.split()[1], 16) for l in open(got)]
+        b = [int(l.split()[1], 16) for l in open(exp)]
+        bad = [(i, x, y) for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        check("2D %s: %d 像素与参考模型逐位一致" % (name, PX), not bad and len(a) == PX and len(b) == PX,
+              "不符 %d 个, 首个 %s" % (len(bad), bad[:1]))
+        return a, out
+
+    # ① 填充 + 裁剪框(§4.1/§5.5)
+    gfx_case("fill_clip", [
+        "setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0",
+        "setreg 0x18 16", "setreg 0x1c 8", "setreg 0x10 20", "setreg 0x14 24",
+        "fill 0x%08x 0xff203040 0 0 %d %d" % (FB, W, H),
+        "fill 0x%08x 0xffa0b0c0 16 16 32 32" % FB,
+    ])
+
+    # ② 位块传送: 颜色键 + 双向翻转(§4.2)
+    src = 0x8000_0000
+    bmp = [("0x%08x" % (src + i * 4), "0x%08x" % ((0xFF000000 | (i * 0x010101)) if i % 3 else 0xFF00FF00))
+           for i in range(16)]
+    mem = ["mem " + " ".join([bmp[0][0]] + [w for _, w in bmp])]
+    gfx_case("blit_colkey_flip", [
+        "setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0",
+        "fill 0x%08x 0xff101010 0 0 %d %d" % (FB, W, H),
+    ] + mem + [
+        "setreg 0x24 0xff00ff00", "setreg 0x28 1",
+        "blit 0x%08x 0x%08x 16 20 20 4 4 0x6 0xff00ff00" % (src, FB + (20 * W + 20) * 4),
+    ])
+
+    # ③ 格式转换: RGB565 源 → ARGB8888 目标(§6.3)
+    two = ["0x%08x" % v for v in (0xF800, 0x07E0, 0x001F, 0x8410, 0xFFFF, 0x0000, 0x1234, 0xABCD)]
+    gfx_case("blit_565", [
+        "setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0",
+        "fill 0x%08x 0xff000000 0 0 %d %d" % (FB, W, H),
+        "mem " + " ".join(["0x80001000"] + two),
+        "blit 0x80001000 0x%08x 0 8 8 4 2 0x8 0" % (FB + (8 * W + 8) * 4),
+    ])
+
+    # ④ 混合 SRC_OVER + 共享边: top-left 规则保证共享边上的像素只被写一次(§5.3/§6.2)
+    def vtx(x, y, r, g, b, a):
+        f = lambda v: "0x%08x" % struct.unpack("<I", struct.pack("<f", v))[0]
+        return [f(x), f(y), f(r), f(g), f(b), f(a)]
+
+    quad = []
+    for v in ((10.0, 10.0, 1, 0, 0, 0.5), (50.0, 10.0, 0, 1, 0, 0.5), (10.0, 50.0, 0, 0, 1, 0.5),
+              (50.0, 10.0, 0, 1, 0, 0.5), (50.0, 50.0, 1, 1, 1, 0.5), (10.0, 50.0, 0, 0, 1, 0.5)):
+        quad += vtx(*v)
+    quad_mem = "mem 0x80002000 " + " ".join(quad)
+    gfx_case("draw_blend", [
+        "setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0",
+        "fill 0x%08x 0xff000000 0 0 %d %d" % (FB, W, H),
+        "setreg 0x20 1",                       # BLEND_MODE = SRC_OVER
+        quad_mem,
+        "draw 0x80002000 6 0",
+    ])
+
+    # ④b 取色约定(GFX.md §2.2 的 ARGB8888): 黑的底上混一层 50% 白 ⇒ 字必须是 0xBF808080。
+    #     这条断言守的是"帧缓冲字节序与 SDL/PPM/内核配色一致"—— 引擎若按 [31:24]=R 打包,
+    #     混合出来的像素在显示时 R/B 互换(而原样搬移的像素正常), 从画面上极难发现。
+    got_blend = raw_blend = None
+    script = write_script(OUT, "gfx_argb", [
+        "setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0",
+        "fill 0x%08x 0xff000000 0 0 %d %d" % (FB, W, H),
+        "setreg 0x20 1",
+        "mem 0x80003000 " + " ".join(vtx(4.0, 4.0, 1, 1, 1, 0.5) + vtx(40.0, 4.0, 1, 1, 1, 0.5) +
+                                    vtx(4.0, 40.0, 1, 1, 1, 0.5)),
+        "draw 0x80003000 3 0",
+    ])
+    d = os.path.join(OUT, "gfx_argb_words.txt")
+    rc, out = run([os.path.join(OUT, "clear.bin"), "--cp-script", script, "--no-check", "--quiet",
+                   "--dump", "0x%08x,%d,%s" % (FB, PX, d)])
+    words = [int(l.split()[1], 16) for l in open(d)] if os.path.exists(d) else []
+    check("2D 取色约定: 黑底 + 50% 白混合 ⇒ 0xBF808080(ARGB8888, A 在最高字节, 与显示路径一致)",
+          0xBF808080 in words, "出现过的字: %s" % sorted({hex(v) for v in words})[:4])
+
+    # ⑤ shader → 2D 联调: gouraud 算出顶点, 2D_DRAW 用 wait_id 等它完成(§1/§4.3)
+    vs = []
+    for v in ((0.0, 0.0, 1, 0, 0, 1), (48.0, 4.0, 0, 1, 0, 1), (4.0, 44.0, 0, 0, 1, 1)):
+        vs += vtx(*v)
+    cross = [
+        "write_reg 0x38 0x20000000",           # FB_BASE 挪开: gouraud 的顶点缓冲在 0x1000_0000
+        "setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0",
+        "fill 0x20000000 0xff101820 0 0 %d %d" % (W, H),
+        "mem 0x10000000 " + " ".join(vs),       # 顶点输入(恒等变换)
+        "load_kernel 0x02001000 %d 0x3" % os.path.getsize(os.path.join(OUT, "gouraud.bin")),
+        "params 0 0x10000000 0x10001000 3 0x3f800000 0 0 0x3f800000 0 0 24",  # in/out/N + 单位矩阵 + stride_bytes
+        "launch 0x20 4 0x4 1",                  # image_flags=USES_GLOBAL_WRITE, signal_id=1
+        "draw 0x10001000 3 1 2 1",              # flags=CLIP_EN, signal=2, wait_id=1
+    ]
+    vdump = os.path.join(OUT, "gfx_vtx.txt")
+    run([os.path.join(OUT, "gouraud.bin"), "--cp-script", write_script(OUT, "gfx_shader_to_2d", cross),
+         "--no-check", "--quiet", "--warps", "4", "--dump", "0x10001000,18,%s" % vdump])
+    got, out = gfx_case("shader_to_2d", cross, fb_base=0x2000_0000,
+                        preload=[("0x10001000", vdump)],
+                        extra_args=["--warps", "4"], img=os.path.join(OUT, "gouraud.bin"))
+    if got is not None:
+        nz = sum(1 for v in got if v != 0xFF101820)
+        # 三角形 (0,0)-(48,4)-(4,44) 的面积 = ½|48·44 − 4·4| = 1048; top-left 规则会把
+        # 落在边上的像素判给相邻三角形, 所以实测比面积略少几个
+        check("2D shader→2D: gouraud 产出的顶点被 2D_DRAW 画成 %d 像素(面积 1048)" % nz,
+              1000 <= nz <= 1048, "非背景像素 %d" % nz)
+
+    # ⑥ 错误路径: 引擎报错 ⇒ CP_ERROR = ENGINE_FAULT(8) + 不释放信号量(GFX.md §7.3)
+    def err_case(name, lines, want_gfx_err):
+        script = write_script(OUT, "gfx_err_%s" % name, lines)
+        sem = os.path.join(OUT, "gfx_err_%s_sem.txt" % name)
+        rc, out = run([os.path.join(OUT, "clear.bin"), "--cp-script", script, "--no-check",
+                       "--dump", "0x03000004,1,%s" % sem])   # SEM[1]: 命令带 signal_id=1
+        semv = int(open(sem).read().split()[1], 16) if os.path.exists(sem) else -1
+        m = re.search(r"退出码 (\d+)", out)
+        check("2D 错误路径 %s: %s ⇒ CP 进错误态、不释放信号量" % (name, want_gfx_err),
+              "ENGINE_FAULT" in out and semv == 0 and m and m.group(1) != "0",
+              "sem=%s out=%s" % (semv, out[-200:]))
+
+    base = ["setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 0"]
+    err_case("bad_reg", base + ["setreg 0x3c 1", "fill 0x%08x 0xff00ff00 0 0 4 4 1" % FB], "BAD_REG")
+    err_case("bad_format", ["setreg 0x00 %d" % W, "setreg 0x04 %d" % H, "setreg 0x0c 7",
+                            "fill 0x%08x 0xff00ff00 0 0 4 4 1" % FB], "BAD_FORMAT")
+    err_case("bad_param", base + ["fill 0x%08x 0xff00ff00 0 0 0 4 1" % FB], "BAD_PARAM")
+    err_case("out_of_range", base + ["fill 0x%08x 0xff00ff00 60 60 8 8 1" % FB], "OUT_OF_RANGE")
+    err_case("bad_prim", base + ["draw 0x80002000 4 0 1"], "BAD_PRIM")
+
+    # ⑦ 成功路径的可观测性: 2D_STATUS.DONE / IRQ_2D_DONE / 信号量(§7.1/§7.2)
+    st = os.path.join(OUT, "gfx_status.txt")
+    rc, out = run([os.path.join(OUT, "clear.bin"), "--cp-script",
+                   write_script(OUT, "gfx_status_cmd", base + [
+                       "fill 0x%08x 0xff00ff00 0 0 8 8 7" % FB,
+                       "read_reg 0x68 0x80003000", "read_reg 0x6c 0x80003004", "read_reg 0x14 0x80003008",
+                   ]), "--no-check", "--dump", "0x80003000,3,%s" % st])
+    vals = [int(l.split()[1], 16) for l in open(st)] if os.path.exists(st) else []
+    ok = len(vals) == 3 and (vals[0] & 0x2) and (vals[0] & 0x4) == 0 and vals[1] == 0 and (vals[2] & 0x8)
+    check("2D 状态: 2D_STATUS.DONE=1、2D_ERROR=0、IRQ_STATUS[3]=IRQ_2D_DONE", ok, str(vals))
+    semv = 0
+    rc, out = run([os.path.join(OUT, "clear.bin"), "--cp-script",
+                   write_script(OUT, "gfx_sem", base + ["fill 0x%08x 0xff00ff00 0 0 8 8 7" % FB]),
+                   "--no-check", "--dump", "0x0300001c,1,%s" % st])
+    semv = int(open(st).read().split()[1], 16) if os.path.exists(st) else 0
+    check("2D 完成 ⇒ SEM[7] 释放(完成语义与 LAUNCH/GEMM 一致)", semv == 1 and "信号量 SEM[7] += 1" in out,
+          "SEM[7]=%s" % semv)
+
+    print("\n== ⑫ car demo: 2D 引擎路径 vs 逐像素 shader, 同一幅画 ==")
+    CAR = os.path.join(SIMDIR, "build", "car")
+
+    def car_run(args, frames=80):        # 80 帧 > 环容量/帧开销 ⇒ 一定跨过多次队列回绕(守 64B 补齐)
+        p = subprocess.run([CAR, "--frames", str(frames), "--fps", "0"] + args,
+                           capture_output=True, text=True, timeout=300)
+        return p.returncode, p.stdout + p.stderr
+
+    for mode, args in (("2D 引擎 FILL/BLIT/DRAW", []), ("逐像素 shader", ["--shader"])):
+        rc, out = car_run(args)
+        check("car(%s): 80 帧全部通过参考模型校验(含队列回绕与精灵右边界裁剪)" % mode,
+              rc == 0 and "全部帧与参考模型一致" in out, out[-300:])
+
+    def car_cycles(args):
+        _, out = car_run(args, frames=2)
+        m = re.search(r"平均 (\d+) 周期/帧", out)
+        return int(m.group(1)) if m else -1
+
+    c_2d, c_sh = car_cycles([]), car_cycles(["--shader"])
+    check("car: 2D 引擎把像素工作从 SM 手里拿走(%d 周期/帧 vs 逐像素 %d 周期/帧)" % (c_2d, c_sh),
+          0 < c_2d < c_sh // 50, "2D=%d shader=%d" % (c_2d, c_sh))
 
     npass = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 70)

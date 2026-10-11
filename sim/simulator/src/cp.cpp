@@ -21,6 +21,7 @@ const char* cp_err_name(CpErr e) {
     case CpErr::ILLEGAL_STATE: return "ILLEGAL_STATE";
     case CpErr::STALE_SM_ERROR:return "STALE_SM_ERROR";
     case CpErr::SM_FAULT:      return "SM_FAULT(模拟器补充)";
+    case CpErr::ENGINE_FAULT:  return "ENGINE_FAULT(模拟器补充)";
     }
     return "?";
 }
@@ -39,13 +40,22 @@ const char* cmd_opcode_name(uint8_t op) {
     case CMD_PARAMS:      return "PARAMS";
     case CMD_GEMM:        return "GEMM";
     }
-    if (op >= 0x10 && op <= 0x17) return "2D_*";
+    switch (op) {                                   // GFX.md §4
+    case GFX_CMD_FILL:    return "2D_FILL";
+    case GFX_CMD_BLIT:    return "2D_BLIT";
+    case GFX_CMD_DRAW:    return "2D_DRAW";
+    case GFX_CMD_SET_REG: return "2D_SET_REG";
+    case GFX_CMD_FLUSH:   return "2D_FLUSH";
+    default: break;
+    }
+    if (op >= 0x10 && op <= 0x17) return "2D_保留";
     return "保留";
 }
 
 // IRQ 位(CMDS §7.4)
 static const uint32_t IRQ_CP_ERROR = 1u << 0, IRQ_CMD_DONE = 1u << 1,
-                      IRQ_LAUNCH_DONE = 1u << 2, IRQ_GEMM_DONE = 1u << 4;
+                      IRQ_LAUNCH_DONE = 1u << 2, IRQ_2D_DONE = 1u << 3,
+                      IRQ_GEMM_DONE = 1u << 4;
 
 bool CommandProcessor::set_err(CpErr e, const std::string& why) {
     if (err_ == CpErr::NO_ERROR) {        // 首个错误保留(§8.3)
@@ -125,6 +135,22 @@ bool CommandProcessor::submit(const std::vector<uint32_t>& words, std::string* e
     for (size_t i = 0; i < words.size(); ++i) qwrite(tail_ + uint32_t(i) * 4, words[i]);
     tail_ += bytes;
     if (tail_ >= end) tail_ -= queue_size_;
+
+    // 驱动契约: 补齐到 submit_pad_ 边界(默认 0 = 不补)。补齐物是一条 NOP 命令(CMDS §6.1),
+    // 这样每写完一条命令 tail 都在边界上 ⇒ 回绕时剩下的空间一定 ≥ 一个完整块。
+    if (submit_pad_) {
+        const uint32_t off = (tail_ - queue_base_ + queue_size_) % queue_size_;
+        uint32_t pad = (submit_pad_ - (off % submit_pad_)) % submit_pad_;
+        if (pad == 4) pad += submit_pad_;                 // 4 字节写不下 NOP(≥2 字)
+        if (pad) {
+            const uint32_t nop_words = pad / 4;
+            qwrite(tail_, (nop_words << 16) | (0u << 8) | CMD_NOP);
+            qwrite(tail_ + 4, 0xFFFF'FFFFu);
+            for (uint32_t i = 2; i < nop_words; ++i) qwrite(tail_ + i * 4, 0u);
+            tail_ += pad;
+            if (tail_ >= end) tail_ -= queue_size_;
+        }
+    }
     return true;
 }
 
@@ -214,6 +240,52 @@ bool CommandProcessor::submit_gemm(const uint32_t desc[16], std::string* err) {
     std::vector<uint32_t> w(desc, desc + 16);
     w[0] = (16u << 16) | (w[0] & 0xFF00u) | CMD_GEMM;
     return submit(w, err);
+}
+
+bool CommandProcessor::submit_2d(uint8_t opcode, const std::vector<uint32_t>& params,
+                                  uint16_t signal_id, uint16_t wait_id, std::string* err) {
+    // GFX.md §4 的长度是固定值: 0x10..0x14 各有规定值, 0x15..0x17 是保留(≥ 2 字, 参数未定)
+    static const int fixed[5] = {6, 9, 8, 4, 2};
+    if (opcode < 0x10 || opcode > 0x17) {
+        if (err) *err = "不是 2D opcode(0x10..0x17)";
+        return false;
+    }
+    const size_t plen = (opcode <= 0x14) ? size_t(fixed[opcode - 0x10]) : (2 + params.size());
+    if (params.size() != plen - 2) {
+        if (err) *err = std::string(cmd_opcode_name(opcode)) + " 需要 " + std::to_string(plen) +
+                        " 个字(现有 " + std::to_string(params.size() + 2) + ", GFX.md §4)";
+        return false;
+    }
+    std::vector<uint32_t> w = hdr(opcode, uint16_t(plen), 0, signal_id, wait_id);
+    for (size_t i = 0; i < params.size(); ++i) w[2 + i] = params[i];
+    return submit(w, err);
+}
+
+bool CommandProcessor::exec_2d(uint8_t opcode, CmdInfo& ci, const uint32_t* w) {
+    // CP 侧只做 §2.4 的长度校验(参数含义不解释, GFX.md §4); 参数/几何问题由引擎报 2D_ERROR,
+    // 再由这里转成 CP_ERROR = ENGINE_FAULT(GFX.md §7.3)。
+    static const int fixed[5] = {6, 9, 8, 4, 2};
+    if (opcode <= 0x14) {
+        const int want = fixed[opcode - 0x10];
+        if (ci.len != want) {
+            char e[128];
+            std::snprintf(e, sizeof(e), "%s 的 length_words 必须是 %d(§2.4/GFX.md §4)", cmd_opcode_name(opcode), want);
+            return set_err(CpErr::CMD_ERROR, e);
+        }
+    } else if (ci.len < 2) {
+        return set_err(CpErr::CMD_ERROR, "2D 保留 opcode 至少 2 字(§2.4)");
+    }
+    char b[160];
+    std::string why;
+    if (!gfx_.exec(opcode, w + 2, ci.len, &why)) {
+        std::snprintf(b, sizeof(b), "%s: %s", cmd_opcode_name(opcode), why.c_str());
+        ci.summary = b;
+        return set_err(CpErr::ENGINE_FAULT, std::string(gfx_err_name(gfx_.error_code())) + " —— " + b);
+    }
+    std::snprintf(b, sizeof(b), "%s(%u 字): 完成(2D_STATUS=0x%x)", cmd_opcode_name(opcode), ci.len, gfx_.status());
+    ci.summary = b;
+    set_irq(IRQ_2D_DONE);                 // §7.4: 某个 2D 命令完成
+    return true;
 }
 
 void CommandProcessor::doorbell() {
@@ -447,14 +519,7 @@ bool CommandProcessor::exec_cmd(CmdInfo& ci, const uint32_t* w) {
         return exec_gemm(w, ci);
 
     default:
-        if (ci.opcode >= 0x10 && ci.opcode <= 0x17) {
-            // 2D 命令(§6.9): CMDS 只规定"按 length_words 跳过并转交 2D 引擎"
-            char b[96];
-            std::snprintf(b, sizeof(b), "2D 命令 0x%02x(%u 字): 转交 2D 引擎(GFX.md, 本模拟器未实现)", ci.opcode, ci.len);
-            ci.summary = b;
-            LogW("2D 命令 0x%02x 被跳过: 2D 引擎不在本模拟器范围", ci.opcode);
-            return true;
-        }
+        if (ci.opcode >= 0x10 && ci.opcode <= 0x17) return exec_2d(ci.opcode, ci, w);
         if (ci.opcode >= 0x80) {
             ci.summary = "厂商自定义 opcode 0x" + std::to_string(ci.opcode) + "(" +
                          std::to_string(ci.len) + " 字): 按长度跳过(§3)";
@@ -655,6 +720,7 @@ bool CommandProcessor::writable_reg(uint32_t off) const {
     case MMIO_CP_ERROR: case MMIO_CMD_TAIL: case MMIO_DOORBELL: case MMIO_IRQ_STATUS:
     case MMIO_IRQ_ENABLE: case MMIO_SEM_BASE: case MMIO_CMD_QUEUE_BASE: case MMIO_CMD_QUEUE_SIZE:
     case MMIO_FB_BASE: case MMIO_CP_RESET: case MMIO_TIMEOUT_CYCLES: case MMIO_GEMM_ERROR:
+    case MMIO_2D_ERROR:
     // CMDS §7: SM*_ERROR 是 "R / 写任意值清零", CMD_HEAD 允许 host 写用于异常恢复(§7.3 的恢复流程要用)
     case MMIO_SM0_ERROR: case MMIO_SM1_ERROR: case MMIO_CMD_HEAD:
         return true;
@@ -679,6 +745,8 @@ uint32_t CommandProcessor::read_reg(uint32_t off) {
     case MMIO_CP_RESET:        return 0;
     case MMIO_GEMM_ERROR:      return gemm_error_;
     case MMIO_GEMM_STATUS:     return gemm_status();     // §6.11: BUSY/DONE/ERROR
+    case MMIO_2D_STATUS:       return gfx_.status();     // GFX.md §7.2: BUSY/DONE/ERROR
+    case MMIO_2D_ERROR:        return gfx_.error();
     default:
         LogW("MMIO 读 0x%02x: 未定义的寄存器(§7 的保留区), 返回 0", off);
         return 0;
@@ -735,6 +803,11 @@ void CommandProcessor::write_reg(uint32_t off, uint32_t v) {
         timeout_cycles_ = v ? v : 0x100000;
         LogI("TIMEOUT_CYCLES ← %u", timeout_cycles_);
         return;
+    case MMIO_2D_ERROR:
+        if (v) LogI("host 清除 2D_ERROR(原值 %s: %s)",
+                    gfx_err_name(gfx_.error_code()), gfx_.error_detail().c_str());
+        gfx_.clear_error();
+        return;
     case MMIO_GEMM_ERROR:
         LogI("host 清除 GEMM_ERROR(原值 0x%x)", gemm_error_);
         gemm_error_ = 0;
@@ -759,6 +832,7 @@ void CommandProcessor::reset() {
     gemm_busy_ = false;
     gemm_done_ = false;
     gemm_error_ = 0;
+    gfx_.reset();                        // §7.3 第 5 条: 复位引擎(丢弃未完成的 2D 命令)
     machine_.reset();                    // 清 SM 错误/FAULT_PC/共享/指令 SRAM, KERNEL_MASK 归零
 }
 

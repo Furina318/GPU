@@ -138,7 +138,12 @@ def assembler_set():
 
 
 def decoder_set():
-    d = open(os.path.join(SIMDIR, "src", "decode.cpp")).read()
+    # 译码器源码按模块分目录(shader/): 不要在检查里写死模块路径, 找不到就报清楚
+    dec = next((os.path.join(SIMDIR, sub, "decode.cpp") for sub in ("shader", "src", "..")
+                if os.path.exists(os.path.join(SIMDIR, sub, "decode.cpp"))), None)
+    if dec is None:
+        raise SystemExit("找不到译码器源码 shader/decode.cpp(模块布局变了? 见 sim/simulator/README.md)")
+    d = open(dec).read()
     return set(re.findall(r'INSTPAT\(\s*"[^"]+"\s*,\s*([A-Za-z0-9_.]+)\s*,', d))
 
 

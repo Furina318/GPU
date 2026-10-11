@@ -129,7 +129,7 @@ def sim_trace(img):
                        capture_output=True, text=True)
     seq = []
     for line in (p.stdout + p.stderr).splitlines():
-        m = re.search(r"pc=0x([0-9a-f]{4})\]\[src/exec\.cpp:\d+\] pc=0x([0-9a-f]{4})", line)
+        m = re.search(r"pc=0x([0-9a-f]{4})\]\[[^\]]*exec\.cpp:\d+\] pc=0x([0-9a-f]{4})", line)
         if m and ", " not in line.split("pc=0x")[-1][:8]:
             seq.append(int(m.group(2), 16))
     return seq
@@ -147,13 +147,13 @@ def main():
     for c in cases:
         src = c if os.path.isabs(c) else os.path.join(HERE, c)
         img = os.path.join(SIMDIR, "build", "tests", os.path.basename(src).replace(".S", ".bin"))
-        if not os.path.exists(img):
-            p3 = subprocess.run([sys.executable, ASM, src, "--format", "image", "-o", img],
-                                capture_output=True, text=True)
-            if p3.returncode != 0:
-                print("  %-16s 汇编失败, 跳过: %s" % (os.path.basename(src), (p3.stdout + p3.stderr).strip()[:200]))
-                ok = False
-                continue
+        # 每次都重新汇编: 残留的旧/坏镜像会让"模型 vs 模拟器"的比较无声地失去意义
+        p3 = subprocess.run([sys.executable, ASM, src, "--format", "image", "-o", img],
+                            capture_output=True, text=True)
+        if p3.returncode != 0:
+            print("  %-16s 汇编失败, 跳过: %s" % (os.path.basename(src), (p3.stdout + p3.stderr).strip()[:200]))
+            ok = False
+            continue
         prog = disassemble(src)
         mine = model_run(prog)
         stop = mine.pop() if mine and isinstance(mine[-1], tuple) else None

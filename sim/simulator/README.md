@@ -75,20 +75,51 @@ trace on|off     q 退出
 
 ## 4. 代码结构
 
+> **构建**: `CXXFLAGS` 带 `-MMD -MP` 并在末尾 `-include` 生成的 `.d` —— 头文件依赖被跟踪。
+> 这一条是踩坑加上的: 没有它时改 `include/cp.hpp` 只重编 `src/cp.cpp`, 链出来的可执行文件是
+> "新 cp.o + 旧 main.o"的**结构体布局不一致**版本, 表现为随机段错误(`make clean` 才能恢复)。
+
+源码按**模块**分目录: `shader/`(SIMT 核) · `2D-engine/`(固定功能 2D 引擎) · `src/`(CP、内存、前端、工具)。
+头文件统一在 `include/`(编译期一个 `-Iinclude`,模块之间不互相包含私有头)。
+
 | 文件 | 职责 |
 |---|---|
-| `src/exec.cpp` | 执行引擎: 取指/译码/执行、barrier、访存、错误、FGMT 调度 |
-| `src/inst.cpp` | ALU / FP32 / fma / setp 的 lane 级语义与掩码写回(可单独测试) |
-| `src/decode.cpp` | 模式编译式译码器(`INSTPAT`)+ 保留字段校验 |
-| `src/cp.cpp` | 命令环、§2.4 校验表、LAUNCH 前置条件交叉核对、信号量、矩阵引擎 v1(INT8→INT32) |
+| `shader/exec.cpp` | 执行引擎: 取指/译码/执行、barrier、访存、错误、FGMT 调度 |
+| `shader/inst.cpp` | ALU / FP32 / fma / setp 的 lane 级语义与掩码写回(可单独测试) |
+| `shader/decode.cpp` | 模式编译式译码器(`INSTPAT`)+ 保留字段校验 |
+| `shader/regfie.cpp` | 寄存器堆(每 lane 一份, 启动清零语义见 ISA §3.1) |
+| `shader/trace.cpp` | 指令轨迹(调试器与 `--trace` 共用; `stack_model_check.py` 依赖它的格式) |
+| `2D-engine/gfx2d.cpp` | **2D 引擎**(GFX.md): 寄存器、四条命令、定点边方程光栅化、混合、ROP 写缓冲、引擎错误码 |
+| `src/cp.cpp` | 命令环、§2.4 校验表、LAUNCH 前置条件交叉核对、信号量、2D 命令分发、矩阵引擎 v1(INT8→INT32) |
 | `src/memory.cpp` | 稀疏全局内存、每 SM 共享内存/指令 SRAM、镜像头校验(CRC)、MMIO 边界 |
 | `src/debugger.cpp` | 交互式调试器 |
 | `src/log.cpp` | 分级日志(控制台/文件/环形缓冲) |
-| `src/main.cpp` | 命令行、启动信息、结果校验(clear/gouraud/matmul 的参考模型)、PPM/内存导出 |
+| `src/main.cpp` | 命令行、启动信息、结果校验(clear/gouraud/matmul/anim/abs 的参考模型)、PPM/内存导出、命令脚本 |
+| `include/gfx2d.hpp` | 2D 引擎的对外契约(寄存器偏移、命令 opcode、错误码、状态), CP 只经它接触引擎 |
+
+### 4.1 2D 引擎怎么用(参考模型与测试)
+
+`--cp-script` 可以直接写 2D 命令(与 GFX.md §4 的参数顺序一致), 因而**同一条命令流可以同时喂给
+C++ 引擎和 Python 参考模型**, 逐像素比较:
+
+```
+setreg 0x00 64          # FB_WIDTH     setreg/gfx 寄存器: GFX.md §3
+setreg 0x04 64          # FB_HEIGHT
+setreg 0x0c 0           # FB_FORMAT = RGBA8888
+fill  0x10000000 0xff00ff00 0 0 64 64      # dst color x y w h        (§4.1)
+mem   0x80000000 <顶点字...>                # host 写全局内存(顶点缓冲/源图)
+blit  0x80000000 0x10002004 0 20 20 4 4 0x6 0xff00ff00   # §4.2
+draw  0x80000000 3 1 2 1                    # vtx count flags signal wait(§4.3)
+flush
+```
+
+`tests/gfx2d_ref.py` 是 GFX.md §5/§6 的**独立 Python 实现**(定点边方程、top-left 规则、重心插值、
+混合与格式转换的舍入逐条重写), `tests/run_tests.py` 的第 ⑪ 节把两边的帧缓冲逐位对比 —— 这比
+"看起来画对了"强得多: 舍入错一位就会红。
 
 ## 5. 已知的规范缝隙(实现按"报错"处理)—— 均已写进 CMDS §8.1/§8.2
 
-- **命令环尾部只剩 4 字节时无法填充**: CMDS §2.1 要求驱动用 `NOP` 填到末尾再回绕,但 §6.1 规定 `NOP ≥ 2 字`,
+- **命令环尾部只剩 4 字节时无法填充**(驱动侧已按 §2 的约定 `set_submit_pad(64)` 规避, 见下): CMDS §2.1 要求驱动用 `NOP` 填到末尾再回绕,但 §6.1 规定 `NOP ≥ 2 字`,
   于是尾部恰好剩 4 字节时**没有任何合法填充**(队列大小只要求是 4 的倍数)。模拟器在这种情况下报错并
   建议"queue_size 取 8 的倍数"(`--cp-fill 126` 可复现),而不是静默错位。要不要把 §2.1 收紧成
   "queue_size 必须是 8 的倍数",是留给规范的一个决定。
@@ -126,7 +157,7 @@ trace on|off     q 退出
 
 ## 8. 测试
 
-`make test` 会跑 `tests/run_tests.py`(65 项)+ `tests/stack_model_check.py`:
+`make test` 会跑 `tests/doc_consistency_check.py` + `tests/isa_ref_check.py` + `tests/stack_model_check.py` + `tests/run_tests.py`(**78 项**, 其中第 ⑪ 节是 2D 引擎与参考模型的逐像素对拍):
 
 - **文档一致性**: `tests/isa_ref_check.py` —— ISA.md §5 的指令表 ↔ 汇编器 ↔ 译码器三方对照 + 位域往返
 - **正例**: clear/gouraud/matmul/abs/anim 结果校验 + 与独立参考模型逐元素比对(abs 是 §7.4 的逐 lane 条件内核,实测 4 次压栈/8 次收敛);

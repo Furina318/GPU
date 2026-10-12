@@ -7,6 +7,7 @@
 | `clear.sg` | 示例: 帧缓冲填充(与手写 `sw/kernels/clear.S` 语义等价) |
 | `abs.sg` | 示例: 逐 lane 条件 + FP32 比较与取负(等价于 `sw/kernels/abs.S`) |
 | `relu_swap.sg` | 示例: 共享内存 + 两次 `bar()` + `while` + 谓词化跨 lane 访存 |
+| `mask_low.sg` | 示例: 位运算/移位(`&` `\|` `>>>`)+ `if/else` + `\|\|` 短路条件 |
 
 ## 用法
 
@@ -16,25 +17,30 @@ python3 compiler.py sg/clear.sg -o build/clear.S          # 看生成的汇编
 python3 compiler.py sg/clear.sg --image build/clear.bin   # 直接出内核镜像
 python3 compiler.py sg/clear.sg --disasm                  # 编译后反汇编(人工核对)
 python3 compiler.py sg/*.sg --asm-dir build --image-dir build   # 批量
+python3 compiler.py sg/clear.sg --stats                   # 编译报告: 布局 + ISA 指令直方图
 
 cd ../sim/simulator
 make sg                    # 把 ../../sw/sg/*.sg 编译成 build/sg/*.bin
 ```
 
-生成器只做**模板展开 + 寄存器分配 + 标签解析**(`grammer.md` §1),不做优化:每个语言构造对应
-一段固定模板,生成的汇编里每条指令都带注释说明它对应源码的哪一部分。
+生成器只做**模板展开 + 寄存器分配 + 标签解析**(`grammer.md` §1),不做复杂优化:每个语言构造对应
+一段固定模板,生成的汇编里每条指令都带注释。少数"模板级"的省事规则(`grammer.md` §5)是:
+
+| 规则 | 效果(汇编后条数) |
+|---|---|
+| 常量折叠 + **立即形式**(`andi/ori/slli/srai/srli`) | `clear.sg` 39 → 33、`abs.sg` 25 → 21、`relu_swap` 59 → 51 |
+| **就地写目标寄存器**(不多做一次位型拷贝) | 同上;谓词化时**不**就地写(算术没有谓词字段,否则条件不成立也会改掉变量) |
+| **常驻常量**(出现最多的 2 个) | 循环体里不再每轮重新装载 `4` 这类常量 |
+
+能力速览:位运算与移位、`&&`/`||` 短路条件、`if/else`、`while`、共享/全局数组、`bar()`、`ass` 插指令、
+`f2i`/`i2f`。四个示例分别覆盖:填充(clear)、逐 lane 条件 + FP32 比较与取负(abs)、
+共享内存 + 屏障 + 跨 lane 交换(relu_swap)、位运算 + 短路条件(mask_low)。
 
 ## 实现注记
 
 下面这些是 v0.1 里没写死(或写错)的地方,**已经按实现回填进 `grammer.md` v0.2**(见其附录 A);
 编译器的行为与规格现在一一对应,列在这里只是方便对照:
 
-| 位置 | 规格原文 | 编译器实际生成 | 理由 |
-|---|---|---|---|
-| `if/else`(§6.5) | `@p1 br.simt __else, __end` | `@!p1 br.simt __else, __end` | 规格模板会把"条件成立"的 lane 送去 else 块;手写内核(car.S/abs.S)都是"条件成立落进 then",所以按后者生成 |
-| `uniform when … goto L`(§6.3) | "不生成 `ipdom`,直接 `j`" | 省掉显式 `ipdom`,由汇编器按 ISA 约定补一条 | ISA 的 `br.simt` 一律配对收敛点(汇编器对任何谓词化 `br.simt` 都补 `ipdom`);语义等价,代价是多一条空转 `ipdom` |
-| 用户级 `when … goto L`(向后跳) | 未说明收敛点怎么取 | 取"此语句之后的下一个标签" | 向后跳(循环回边)的收敛点是**循环出口**不是循环头;`clear.sg` 的 `when i != T goto loop` 正好落在 `done:` |
-| 关键字 `floar`(§2) | 关键字表里写的是 `floar` | 接受 `floar` 并按 `float` 处理 | 显然是 `float` 的笔误,两种写法都收 |
 
 **语义检查**(`grammer.md` §9 的错误码全部有反例,见 `make test` 第 ⑬ 节):
 

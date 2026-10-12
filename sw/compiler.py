@@ -14,16 +14,6 @@ SimpleGPU 自定义语言(sg)编译器
     python3 compiler.py sg/abs.sg --disasm                   # 编译 + 反汇编(人工核对)
 
 错误码与检查见 grammer.md §9(E001..E014); 模板展开见 §6; 内置函数见 §7。
-
-文档没写死、但实现必须选一种的地方(都在生成的注释里可核对):
-  * `if/else`(§6.5)的模板写成 `@p1 br.simt __else, __end`, 会把"条件成立"的 lane 送去 else 块;
-    本编译器生成 `@!p1 br.simt __else, __end`(成立的 lane 落进 then), 与手写内核
-    (car.S 的 `@p2 br.simt neg, join`、abs.S)的写法一致。
-  * `uniform when ... goto L`(§6.3)"不生成 ipdom"这一点在本 ISA 里做不到: br.simt 一律配对
-    收敛点(汇编器对**任何**谓词化 br.simt 都会补 ipdom)。这里把收敛点显式写成 L 本身 ——
-    两条路径都在 L 汇合, 语义等价, 代价是多一条(空转的)ipdom。
-  * 用户级 `when <cond> goto L` 的收敛点: L 在后方(向后跳)时取"此语句之后的下一个标签"
-    (clear.sg 的 `when i != T goto loop` 正好落在 `done:`), 否则取 L 自身。
 """
 
 import argparse
@@ -31,7 +21,7 @@ import os
 import re
 import struct
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,8 +62,9 @@ KEYWORDS = {'kernel', 'var', 'param', 'goto', 'when', 'uniform', 'if', 'else', '
             'while', 'bar', 'exit', 'int', 'float', 'floar', '__shared__', '__global__',
             'ass', 'per_warp', 'shared'}
 
-SYMBOLS = ['-:', '==', '!=', '<=', '>=', '&&', '||',
-           '=', '+', '-', '*', '/', '%', '<', '>', '(', ')', '[', ']', ',', ':', '@']
+SYMBOLS = ['-:', '==', '!=', '<=', '>=', '&&', '||', '>>>', '<<', '>>',
+           '=', '+', '-', '*', '/', '%', '&', '|', '^', '~', '<', '>',
+           '(', ')', '[', ']', ',', ':', '@']
 
 NUM_RE = re.compile(r'0[xX][0-9a-fA-F]+|(?:\d+\.\d*|\.\d+|\d+)[fF]?')
 ID_RE = re.compile(r'[A-Za-z_]\w*')
@@ -533,7 +524,8 @@ class Parser:
         return Call(line, name, args)
 
     # ── 表达式 ──
-    PRECEDENCE = [('||',), ('&&',), ('==', '!='), ('<', '<=', '>', '>='),
+    PRECEDENCE = [('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!='),
+                  ('<', '<=', '>', '>='), ('<<', '>>', '>>>'),
                   ('+', '-'), ('*', '/', '%')]
 
     def parse_expr(self, level: int = 0) -> Expr:
@@ -551,13 +543,15 @@ class Parser:
 
     def parse_unary(self) -> Expr:
         t = self.peek()
-        if t.kind == 'SYM' and t.text in ('-', '+', '!'):
+        if t.kind == 'SYM' and t.text in ('-', '+', '!', '~'):
             self.next()
             operand = self.parse_unary()
             if t.text == '+':
                 return operand
             if t.text == '!':
                 return Un(t.line, 'not', operand)
+            if t.text == '~':
+                return Un(t.line, 'bitnot', operand)
             if isinstance(operand, Num):
                 return Num(t.line, -operand.value, operand.is_float)
             return Un(t.line, '-', operand)
@@ -622,6 +616,20 @@ KNOWN_MNEMONICS = (set(assembly.INT_ALU) | set(assembly.FP_ALU) | set(assembly.F
                     'exit', 'tmov', 'wmov', 'imad', 'lui', 'ld.g', 'ld.s', 'st.g', 'st.s'})
 
 
+def _walk(node):
+    """深度遍历语法树里的所有节点(表达式与语句)。"""
+    yield node
+    if is_dataclass(node):
+        for f in fields(node):
+            v = getattr(node, f.name)
+            if isinstance(v, (Expr, Stmt)):
+                yield from _walk(v)
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, (Expr, Stmt)):
+                        yield from _walk(x)
+
+
 class FuncGen:
     """一个 kernel 的代码生成(§5/§6/§7 的模板展开 + 寄存器/谓词分配)。"""
 
@@ -640,6 +648,7 @@ class FuncGen:
         self.free_preds = list(range(1, NUM_PREDS))
         self.temp_regs: List[int] = []
         self.const_cache: Dict[int, int] = {}
+        self.pinned: Dict[int, int] = {}          # 常驻常量(见 plan_pinned)
         self.seq = 0
         self.cur_pred: Optional[int] = None          # §6.4: 当前语句是否被谓词化
         self.shared_total = 0
@@ -710,6 +719,34 @@ class FuncGen:
             self.free_preds.append(p)
             self.free_preds.sort()
 
+    # ── 常量折叠(只折叠纯整型常量表达式; float 不折, 免得舍入语义被改写) ──
+    def const_int(self, e: Expr) -> Optional[int]:
+        if isinstance(e, Num):
+            return None if e.is_float else int(e.value)
+        if isinstance(e, Sym) and e.off is None and e.name in self.consts:
+            return int(self.consts[e.name])
+        if isinstance(e, Var) and e.index is None and e.name in self.consts \
+                and e.name not in self.vars:            # 偏移里直接写常量名: @const[slot]
+            return int(self.consts[e.name])
+        if isinstance(e, Un):
+            v = self.const_int(e.operand)
+            if v is None:
+                return None
+            return {'-': lambda x: -x, '~': lambda x: ~x}.get(e.op, lambda x: None)(v)
+        if isinstance(e, Bin):
+            a, b = self.const_int(e.lhs), self.const_int(e.rhs)
+            if a is None or b is None:
+                return None
+            try:
+                v = {'+': a + b, '-': a - b, '*': a * b, '&': a & b, '|': a | b, '^': a ^ b,
+                     '<<': a << b, '>>': a >> b, '>>>': (a & 0xFFFFFFFF) >> b,
+                     '/': int(a / b) if (b and (a % b == 0 or a * b > 0)) else None,
+                     '%': a % b if b else None}[e.op]
+            except (KeyError, OverflowError):
+                return None
+            return None if v is None else int(v)
+        return None
+
     @staticmethod
     def _lui_lit(hi20: int) -> str:
         """lui 的 imm20 按 ISA 是**有符号**的(rd = sext(imm20) << 12), 汇编器要求写成 -0x80000 这种形式。"""
@@ -745,10 +782,52 @@ class FuncGen:
         self.emit(f"addi r{rd}, r{rd}, {lo12 & 0xFF}", comment or f"= 0x{v:08x}(4 条)")
         self.release(rt)
 
+    def const_value(self, value: int, line: int, dest: Optional[int] = None
+                    ) -> Tuple[int, str, bool]:
+        """把一个整型常量放进寄存器(优先复用常驻寄存器, 其次目标寄存器, 最后临时寄存器)。"""
+        v = int(value) & 0xFFFFFFFF
+        sv = v - (1 << 32) if v >= (1 << 31) else v
+        if v in self.pinned:
+            return self.pinned[v], 'int', True
+        if dest is not None:
+            if sv == 0:
+                return 0, 'int', True
+            self.load_imm(dest, sv)
+            return dest, 'int', True
+        return self.const_reg(sv, line), 'int', True
+
+    # ── 常驻常量: 把出现最多的两个整型常量长期占住寄存器 ──
+    def plan_pinned(self) -> None:
+        """统计整型常量出现次数, 最多常驻 2 个(只在还剩 ≥4 个空闲寄存器时)。
+
+        奖励是多轮循环里的重复装载: `imad rd, ri, r4, rb` 需要"4"在寄存器里,
+        每轮都 `addi rt, r0, 4` 是纯浪费。
+        """
+        from collections import Counter
+        cnt: Counter = Counter()
+        for node in _walk(self.k):
+            if isinstance(node, Expr) and not isinstance(node, (Num, Sym)):
+                cv = self.const_int(node)
+                if cv is not None:
+                    cnt[cv & 0xFFFFFFFF] += 1
+            elif isinstance(node, Num) and not node.is_float:
+                cnt[int(node.value) & 0xFFFFFFFF] += 1
+            elif isinstance(node, Sym) and node.off is None and node.name in self.consts:
+                cnt[int(self.consts[node.name]) & 0xFFFFFFFF] += 1
+        for value, _times in cnt.most_common(2):
+            if value == 0 or len(self.free_regs) < 5:       # 变量优先: 留够寄存器
+                continue
+            r = self.alloc_reg(0, '常驻常量')
+            self.load_imm(r, value, f"常驻常量 0x{value:08x}")
+            self.pinned[value] = r
+
     def const_reg(self, value: int, line: int) -> int:
         """常量放寄存器, 同一条语句内复用(§5 的 imad/fma 需要寄存器形式的操作数)。"""
-        if value in self.const_cache and self.const_cache[value] in self.temp_regs:
-            return self.const_cache[value]
+        v = int(value) & 0xFFFFFFFF
+        if v in self.pinned:
+            return self.pinned[v]
+        if v in self.const_cache and self.const_cache[v] in self.temp_regs:
+            return self.const_cache[v]
         r = self.temp(line, '常量寄存器')
         self.load_imm(r, value)
         self.const_cache[value] = r
@@ -797,6 +876,10 @@ class FuncGen:
         """dest 给定时, 能把结果直接算进这个寄存器(省掉一次拷贝)。"""
         if dest is not None and isinstance(e, (Num, Sym)):
             return self.gen_leaf_into(e, want, dest)
+        if not isinstance(e, (Num, Sym)):
+            cv = self.const_int(e)                      # 常量折叠: 4*8、@base+8 之类
+            if cv is not None:
+                return self.const_value(cv, e.line, dest)
         if isinstance(e, Num):
             t = 'float' if e.is_float else 'int'
             if float(e.value) == 0.0:            # 0/0.0 的位型都是 0 ⇒ 直接用 r0(§3.1)
@@ -828,9 +911,9 @@ class FuncGen:
                 r = self.temp(e.line, '常量')
                 self.load_imm(r, base, f"@{e.name}")
                 return r, 'int', True
-            if not isinstance(e.off, Num):
-                raise SgError('E010', e.line, "常量区偏移必须是字面量(编译期要检查对齐)")
-            off = int(e.off.value)
+            off = self.const_int(e.off)
+            if off is None:
+                raise SgError('E010', e.line, "常量区偏移必须是编译期常量(要检查对齐)")
             if off % 4:
                 raise SgError('E010', e.line, f"@{e.name}[{off}] 未 4B 对齐")
             if off < 0:
@@ -859,21 +942,27 @@ class FuncGen:
         if isinstance(e, Un):
             if e.op == 'not':
                 return self.gen_not(e)
+            if e.op == 'bitnot':
+                r, t, uni = self.gen_expr(e.operand, 'int')
+                if t != 'int':
+                    raise SgError('E004', e.line, "~ 只支持 int(按位取反)")
+                rd = dest if dest is not None else self.temp(e.line, '按位取反')
+                self.emit(f"xori r{rd}, r{r}, -1", "int 按位取反 = 异或全 1(§3)")
+                return rd, 'int', uni
             r, t, uni = self.gen_expr(e.operand, want)
+            rd = dest if dest is not None else self.temp(e.line, '取负')
             if t == 'int':
-                rd = self.temp(e.line, '取负')
                 self.emit(f"sub r{rd}, r0, r{r}", "int 取负 = 0 - x(§3)")
                 return rd, 'int', uni
             if t == 'float':
                 m = self.const_reg(0x80000000, e.line)
-                rd = self.temp(e.line, '取负')
                 self.emit(f"xor r{rd}, r{r}, r{m}", "float 取负 = 异或符号位(§3)")
                 return rd, 'float', uni
             raise SgError('E004', e.line, "取负只能用于 int / float")
         if isinstance(e, Bin):
-            return self.gen_bin(e, want)
+            return self.gen_bin(e, want, dest)
         if isinstance(e, Call):
-            return self.gen_call_expr(e, want)
+            return self.gen_call_expr(e, want, dest)
         raise SgError(None, e.line, "无法生成的表达式")
 
     def gen_leaf_into(self, e: Expr, want: Optional[str], dest: int) -> Tuple[int, str, bool]:
@@ -903,9 +992,9 @@ class FuncGen:
                 raise SgError('E010', e.line, f"常量 {e.name}=0x{base:x} 未 4B 对齐")
             self.load_imm(dest, base, f"@{e.name}")
             return dest, 'int', True
-        if not isinstance(e.off, Num) or int(e.off.value) % 4 or int(e.off.value) < 0:
-            raise SgError('E010', e.line, f"@{e.name}[...] 的偏移必须是 4B 对齐的非负字面量")
-        off = int(e.off.value)
+        off = self.const_int(e.off) if e.off is not None else 0
+        if off is None or off % 4 or off < 0:
+            raise SgError('E010', e.line, f"@{e.name}[...] 的偏移必须是 4B 对齐的非负编译期常量")
         cr = self.const_reg(base, e.line)
         ty = want or 'int'
         self.emit_pred(f"ld.g r{dest}, {off}(r{cr})", f"@{e.name}[{off}] → {ty}")
@@ -944,7 +1033,8 @@ class FuncGen:
                   f"&{v.name}[i] = 0x{v.base:x} + i*4")
         return ra
 
-    def gen_call_expr(self, e: Call, want: Optional[str]) -> Tuple[int, str, bool]:
+    def gen_call_expr(self, e: Call, want: Optional[str],
+                      dest: Optional[int] = None) -> Tuple[int, str, bool]:
         name = e.name
         if name not in BUILTINS:
             raise SgError('E003', e.line, f"未知函数 {name}()")
@@ -959,17 +1049,18 @@ class FuncGen:
         if name in ('ldx', 'lds'):
             ty = want or 'int'
             ra, _, _ = self.gen_expr(e.args[0], 'int')
-            rd = self.temp(e.line, name)
+            rd = dest if dest is not None else self.temp(e.line, name)
             op = 'ld.g' if name == 'ldx' else 'ld.s'
             self.emit_pred(f"{op} r{rd}, 0(r{ra})", f"{name}() → {ty}")
             return rd, ty, False
         if name == 'ceildiv':
             ra, _, ua = self.gen_expr(e.args[0], 'int')
             rb, _, ub = self.gen_expr(e.args[1], 'int')
-            rd = self.temp(e.line, 'ceildiv')
-            self.emit(f"addi r{rd}, r{rb}, -1", "ceildiv = (a + b - 1) / b(§7)")
-            self.emit(f"add r{rd}, r{ra}, r{rd}")
-            self.emit(f"divu r{rd}, r{rd}, r{rb}", "标量循环次数由标量算出(§8)")
+            rt = self.temp(e.line, 'ceildiv 临时')
+            rd = dest if dest is not None else self.temp(e.line, 'ceildiv')
+            self.emit(f"addi r{rt}, r{rb}, -1", "ceildiv = (a + b - 1) / b(§7)")
+            self.emit(f"add r{rt}, r{ra}, r{rt}")
+            self.emit(f"divu r{rd}, r{rt}, r{rb}", "标量循环次数由标量算出(§8)")
             return rd, 'int', ua and ub
         if name in ('f2i', 'i2f'):
             src, sty, uni = self.gen_expr(e.args[0])
@@ -977,12 +1068,13 @@ class FuncGen:
                 raise SgError('E004', e.line, "f2i() 的参数必须是 float")
             if name == 'i2f' and sty != 'int':
                 raise SgError('E004', e.line, "i2f() 的参数必须是 int")
-            rd = self.temp(e.line, name)
+            rd = dest if dest is not None else self.temp(e.line, name)
             self.emit(f"{name} r{rd}, r{src}", f"{name}() 显式转换(§3)")
             return rd, ret, uni
         raise SgError('E003', e.line, f"{name}() 不能用在表达式里")
 
-    def gen_bin(self, e: Bin, want: Optional[str]) -> Tuple[int, str, bool]:
+    def gen_bin(self, e: Bin, want: Optional[str],
+                dest: Optional[int] = None) -> Tuple[int, str, bool]:
         if e.op in ('==', '!=', '<', '<=', '>', '>='):
             return self.gen_compare(e)
         if e.op in ('&&', '||'):
@@ -991,6 +1083,8 @@ class FuncGen:
         rr, rt, ru = self.gen_expr(e.rhs, want if want else lt)
         res_t = 'float' if 'float' in (lt, rt) else 'int'
         uni = lu and ru
+        if res_t == 'float' and e.op in ('&', '|', '^', '<<', '>>', '>>>'):
+            raise SgError('E004', e.line, f"{e.op} 只支持 int(按位/移位运算)")
         if res_t == 'float':
             if lt == 'int':
                 nr = self.temp(e.line, '提升')
@@ -1000,7 +1094,7 @@ class FuncGen:
                 nr = self.temp(e.line, '提升')
                 self.emit(f"i2f r{nr}, r{rr}", "int → float 提升(§3)")
                 rr = nr
-        rd = self.temp(e.line, '运算结果')
+        rd = dest if dest is not None else self.temp(e.line, '运算结果')
         if res_t == 'int':
             # §5: a * b + c 合成一条 imad
             if e.op == '+' and isinstance(e.lhs, Bin) and e.lhs.op == '*':
@@ -1008,11 +1102,23 @@ class FuncGen:
                 b, _, _ = self.gen_expr(e.lhs.rhs, 'int')
                 self.emit(f"imad r{rd}, r{a}, r{b}, r{rr}", "a*b + c → imad(§5)")
                 return rd, 'int', uni
-            table = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'rem'}
+            table = {'+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'rem',
+                     '&': 'and', '|': 'or', '^': 'xor', '<<': 'sll', '>>': 'sra', '>>>': 'srl'}
             if e.op not in table:
                 raise SgError('E004', e.line, f"int 不支持运算符 {e.op}")
+            # 立即形式(ISA §5.4): 移位量与位掩码常常是常量 ⇒ 省一条常量装载。
+            # `>>` 是算术右移(sra, 符号位扩展), `>>>` 是逻辑右移(srl)。
+            imm_op = {'&': 'andi', '|': 'ori', '^': 'xori', '<<': 'slli',
+                      '>>': 'srai', '>>>': 'srli'}.get(e.op)
+            cv = self.const_int(e.rhs)
+            if imm_op and cv is not None and -256 <= cv <= 255 and cv >= 0:
+                self.emit(f"{imm_op} r{rd}, r{lr}, {cv}",
+                          f"int {e.op} 立即形式(§5.4: 移位量/掩码是常量)")
+                return rd, 'int', uni
             self.emit(f"{table[e.op]} r{rd}, r{lr}, r{rr}",
-                      f"int {e.op}" + ("(有符号)" if e.op in ('/', '%') else ""))
+                      f"int {e.op}" + ("(有符号除法)" if e.op in ('/', '%') else
+                                       "(算术右移)" if e.op == '>>' else
+                                       "(逻辑右移)" if e.op == '>>>' else ""))
             return rd, 'int', uni
         if e.op in ('/', '%'):
             raise SgError('E012', e.line, f"FP {'除法' if e.op == '/' else '取余'}不支持(§8)")
@@ -1105,14 +1211,17 @@ class FuncGen:
                 if st.target.index is None:
                     raise SgError(None, st.line, f"数组 {name} 不能整体赋值")
                 addr = self.array_addr(v, st.target.index, st.line)
-                val, vt, _ = self.gen_expr(st.value, v.vtype)
+                val, vt, _ = self.gen_expr(st.value, v.vtype,
+                                           dest=self.temp(st.line, '数组元素临时'))
                 if vt == 'pred':
                     raise SgError('E004', st.line, "比较式的结果是谓词, 不能直接赋值")
                 self.check_assign_type(v, vt, st.line)
                 op = 'st.s' if v.space == 'shared' else 'st.g'
                 self.emit_pred(f"{op} 0(r{addr}), r{val}", f"{name}[i] = ...  谓词化写(§6.4)")
                 return
-            val, vt, uni = self.gen_expr(st.value, v.vtype, dest=v.reg)
+            # 谓词化时不就地写变量(见下), 其余情形直接算进目标寄存器
+            val, vt, uni = self.gen_expr(st.value, v.vtype,
+                                         dest=v.reg if self.cur_pred is None else None)
             if vt == 'pred':
                 raise SgError('E004', st.line, "比较式的结果是谓词, 不能直接赋值")
             self.check_assign_type(v, vt, st.line)
@@ -1181,36 +1290,54 @@ class FuncGen:
             raise SgError('E014', st.line, f"未知指令 {mn!r}(ISA.md §5 的指令表)")
         self.emit(text, "ass: 直接插入(§4.6)")
 
+    def emit_cond_branch(self, cond: Expr, target: str, reconv: str, sense: bool,
+                         force_uniform: bool = False) -> bool:
+        """把条件编译成"满足 sense 时跳到 target"。
+
+        比较式 ⇒ 一条 `setp` + 一条谓词化 `br.simt`;
+        `&&`/`||` ⇒ **短路**:只判到能定论为止(`A && B` 在 A 为假时不再判 B)。
+        返回条件是否对所有 lane 一致(均匀), 供 §6.8 的 bar()/循环次数检查使用。
+        """
+        if isinstance(cond, Bin) and cond.op in ('&&', '||'):
+            trivial = (cond.op == '&&' and not sense) or (cond.op == '||' and sense)
+            if trivial:                      # 顺序判两次: 短路天然成立
+                ua = self.emit_cond_branch(cond.lhs, target, reconv, sense)
+                ub = self.emit_cond_branch(cond.rhs, target, reconv, sense)
+                return ua and ub
+            skip = self.new_label('short')   # 第一个条件已经能定论 ⇒ 跳过第二个
+            ua = self.emit_cond_branch(cond.lhs, skip, skip, not sense)
+            ub = self.emit_cond_branch(cond.rhs, target, reconv, sense)
+            self.label(skip)
+            return ua and ub
+        mark = self.save_temps()
+        try:
+            p, ty, uni = self.gen_expr(cond)
+            if ty != 'pred':
+                raise SgError('E004', cond.line, "条件必须是比较式或它们的 && / || 组合(§3)")
+            if not (uni or force_uniform):
+                self.emit(f"ipdom {reconv}", f"收敛点 = {reconv}(§6.3)")
+            self.emit(f"@p{p} br.simt {target}, {reconv}" if sense
+                      else f"@!p{p} br.simt {target}, {reconv}",
+                      ("条件成立" if sense else "条件不成立") + f"的 lane 跳到 {target}")
+            self.record_label_ref(target, cond.line)
+            if reconv in self.labels:
+                self.record_label_ref(reconv, cond.line)
+            self.free_pred(p)
+            return bool(uni or force_uniform)
+        finally:
+            self.restore_temps(mark)
+
     def gen_goto(self, st: Goto) -> None:
         if st.cond is None:
             self.emit(f"j {st.label}", f"goto {st.label}(§6.2; j 由汇编器展开成 br.simt)")
             self.record_label_ref(st.label, st.line)
             return
-        mark = self.save_temps()
-        try:
-            p, ty, uni = self.gen_expr(st.cond)
-            if ty != 'pred':
-                raise SgError('E004', st.line, "when 之后必须是比较式(§6.3)")
-            if st.label in self.labels:             # 向后跳: 收敛点取之后的下一个标签
-                reconv = self.next_label_after(st.line) or st.label
-            else:
-                reconv = st.label
-            if st.uniform or uni:
-                # 条件对所有 lane 一致: 文档要求"不生成 ipdom"。ISA 的 br.simt 必须有收敛点,
-                # 所以这里省掉显式 ipdom, 由汇编器按约定补一条(语义等价, 只是少了发散开销)。
-                self.emit(f"@p{p} br.simt {st.label}, {reconv}",
-                          f"uniform when: 条件一致, 收敛点 {reconv}(汇编器补 ipdom)")
-            else:
-                self.emit(f"ipdom {reconv}", f"收敛点 = {reconv}(§6.3)")
-                self.emit(f"@p{p} br.simt {st.label}, {reconv}",
-                          f"条件成立的 lane 跳到 {st.label}")
-            self.record_label_ref(st.label, st.line)
-            if reconv in self.labels:
-                self.record_label_ref(reconv, st.line)
-            self.goto_uniform[id(st)] = bool(st.uniform or uni)
-            self.free_pred(p)
-        finally:
-            self.restore_temps(mark)
+        if st.label in self.labels:                 # 向后跳: 收敛点取之后的下一个标签
+            reconv = self.next_label_after(st.line) or st.label
+        else:
+            reconv = st.label
+        uni = self.emit_cond_branch(st.cond, st.label, reconv, True, force_uniform=st.uniform)
+        self.goto_uniform[id(st)] = bool(st.uniform or uni)
 
     def next_label_after(self, line: int) -> Optional[str]:
         best, best_line = None, None
@@ -1221,17 +1348,40 @@ class FuncGen:
         return best
 
     def gen_when_stmt(self, st: WhenStmt) -> None:
-        """§6.4: setp + 谓词化指令(不发散)"""
+        """§6.4: setp + 谓词化指令(不发散)。
+
+        两种情形退化成"分支"而不是谓词化:
+          ① 条件里有 `&&`/`||`(ISA 没有 andp/orp ⇒ 一个谓词存不下两个条件的与);
+          ② 已经在另一个 `when` 体内(同理, 外层条件会被丢掉 ⇒ 必须真的分支)。
+        """
+        simple = (not isinstance(st.cond, Bin) or st.cond.op not in ('&&', '||'))
+        if simple and self.cur_pred is None:
+            mark = self.save_temps()
+            try:
+                p, ty, uni = self.gen_expr(st.cond)
+                if ty != 'pred':
+                    raise SgError('E004', st.line, "when 之后必须是比较式(§6.4)")
+                prev, prev_div = self.cur_pred, self.in_divergent
+                self.cur_pred = p
+                # 谓词化块同样是"部分 lane 执行": 里面 bar() 会死等(§6.8)
+                self.in_divergent = prev_div or not uni
+                self.gen_stmt(st.body)
+                self.cur_pred, self.in_divergent = prev, prev_div
+                self.free_pred(p)
+            finally:
+                self.restore_temps(mark)
+            return
+        # 分支形式: 条件不成立就跳过整个语句(语义与谓词化等价, 代价是一条 br.simt)
         mark = self.save_temps()
         try:
-            p, ty, uni = self.gen_expr(st.cond)
-            if ty != 'pred':
-                raise SgError('E004', st.line, "when 之后必须是比较式(§6.4)")
-            prev = self.cur_pred
-            self.cur_pred = p
+            skip = self.new_label('wskip')
+            uni = self.emit_cond_branch(st.cond, skip, skip, False)
+            prev, prev_div = self.cur_pred, self.in_divergent
+            self.cur_pred = None
+            self.in_divergent = prev_div or not uni
             self.gen_stmt(st.body)
-            self.cur_pred = prev
-            self.free_pred(p)
+            self.cur_pred, self.in_divergent = prev, prev_div
+            self.label(skip)
         finally:
             self.restore_temps(mark)
 
@@ -1239,15 +1389,9 @@ class FuncGen:
         """§6.5(极性按手写内核的写法: 条件成立落进 then)"""
         mark = self.save_temps()
         try:
-            p, ty, uni = self.gen_expr(st.cond)
-            if ty != 'pred':
-                raise SgError('E004', st.line, "if 之后必须是比较式(§6.5)")
             end_l = self.new_label('end')
             else_l = end_l if not st.else_body else self.new_label('else')
-            self.emit(f"ipdom {end_l}", "if: 收敛点(§6.5)")
-            self.emit(f"@!p{p} br.simt {else_l}, {end_l}",
-                      "条件不成立的 lane 走 " + ("end" if not st.else_body else "else"))
-            self.free_pred(p)
+            uni = self.emit_cond_branch(st.cond, else_l, end_l, False)
             was_div = self.in_divergent
             self.in_divergent = was_div or not uni
             self.gen_stmts(st.then_body)
@@ -1266,15 +1410,10 @@ class FuncGen:
         self.label(loop_l)
         mark = self.save_temps()
         try:
-            p, ty, uni = self.gen_expr(st.cond)
-            if ty != 'pred':
-                raise SgError('E004', st.line, "while 之后必须是比较式(§6.6)")
+            uni = self.emit_cond_branch(st.cond, end_l, end_l, False)
             if not uni:
                 raise SgError('E005', st.line,
-                               "循环条件依赖 tid()/wid()(循环次数必须标量, §8)")
-            self.emit(f"ipdom {end_l}", "while: 收敛点(§6.6)")
-            self.emit(f"@!p{p} br.simt {end_l}, {end_l}", "条件不成立就跳出")
-            self.free_pred(p)
+                               "循环条件依赖 tid()/wid() 或访存结果(循环次数必须标量, §8)")
             was_div = self.in_divergent
             self.in_divergent = was_div or not uni
             self.gen_stmts(st.body)
@@ -1285,6 +1424,9 @@ class FuncGen:
             self.restore_temps(mark)
 
     def record_label_ref(self, name: str, line: int) -> None:
+        """登记标签引用; `__` 开头的是编译器内部标签, 不参与"用户标签是否定义"的检查。"""
+        if name.startswith('__'):
+            return
         self.label_refs.append((name, line))
 
     # ── 入口 ──
@@ -1293,20 +1435,25 @@ class FuncGen:
         self.out.append(f"; ── 由 sw/compiler.py 从 {os.path.basename(self.path)} 生成(grammer.md)──")
         self.out.append(f"; kernel {k.name}: 每个语言构造按 §6 的模板展开, 不做优化(§1)")
         self.declare()
+        self.plan_pinned()
         for d in k.decls:
             if isinstance(d, ParamDecl):
                 if d.base not in self.consts:
                     raise SgError('E009', d.line, f"未定义符号 @{d.base}")
                 for n, offe in zip(d.names, d.offs):
-                    if not isinstance(offe, Num):
-                        raise SgError('E010', d.line, "param 的偏移必须是字面量")
-                    off = int(offe.value)
+                    off = self.const_int(offe)          # 字面量或 -: 常量表达式都可以
+                    if off is None:
+                        raise SgError('E010', d.line, "param 的偏移必须是编译期常量")
                     if off % 4 or off < 0:
                         raise SgError('E010', d.line, f"@{d.base}[{off}] 未 4B 对齐")
                     cr = self.const_reg(self.consts[d.base], d.line)
                     v = self.vars[n]
                     self.emit(f"ld.g r{v.reg}, {off}(r{cr})", f"param {n} ← @{d.base}[{off}]")
         self.gen_stmts(k.body)
+        # 内核没有以 exit 收尾 ⇒ 补一条(否则 PC 会走过镜像末尾, 变成 ILLEGAL_INSTR)
+        last = next((l for l in reversed(self.out) if l.strip() and not l.strip().startswith(';')), '')
+        if 'exit' not in last:
+            self.emit("exit", "编译器补的收尾 exit(§7)")
         for name, line in self.label_refs:
             if name not in self.labels:
                 raise SgError('E007', line, f"未定义标签 {name}")
@@ -1329,6 +1476,8 @@ def compile_source(src: str, path: str, global_base: int, comments: bool = True
     info = {
         'kernel': kernel.name,
         'instrs': gen.n_instr,
+        'pinned': len(gen.pinned),
+        'hist': mnemonic_histogram(text),
         'regs': len(gen.used_regs),
         'preds': len(gen.used_preds),
         'shared': gen.shared_total,
@@ -1336,6 +1485,15 @@ def compile_source(src: str, path: str, global_base: int, comments: bool = True
         'labels': len(gen.labels),
     }
     return text, info
+
+
+def mnemonic_histogram(asm_text: str) -> Dict[str, int]:
+    """统计汇编后的指令直方图(含汇编器补的 ipdom) —— 用来核对"这个内核用到了 ISA 的哪些特性"。"""
+    asm = assembly.assemble(asm_text)
+    hist: Dict[str, int] = {}
+    for ins in asm.instrs:
+        hist[ins.mnemonic] = hist.get(ins.mnemonic, 0) + 1
+    return hist
 
 
 def build_image(asm_text: str) -> Tuple[bytes, int]:
@@ -1357,6 +1515,8 @@ def main() -> int:
                     help='__global__ 数组的分配基址(默认 DDR 0x80000000)')
     ap.add_argument('--no-comments', action='store_true', help='生成的汇编不带注释')
     ap.add_argument('--disasm', action='store_true', help='编译后打印反汇编')
+    ap.add_argument('--stats', action='store_true',
+                    help='打印编译报告: 寄存器/共享/全局布局 + ISA 指令直方图')
     ap.add_argument('-q', '--quiet', action='store_true')
     a = ap.parse_args()
 
@@ -1391,6 +1551,14 @@ def main() -> int:
                       f"共享 {info['shared']}B, 全局 {info['global_used']}B, "
                       f"用户标签 {info['labels']}"
                       + (f", flags=0x{flags:x}" if flags is not None else ""), file=sys.stderr)
+            if a.stats:
+                hist = info['hist']
+                print(f"[sg] {info['kernel']}: 汇编后共 {sum(hist.values())} 条指令, "
+                      f"用到 {len(hist)} 种;寄存器 {info['regs']}/31(常驻常量 {info['pinned']}), "
+                      f"谓词 {info['preds']}/3, 共享 {info['shared']}B, "
+                      f"全局 {info['global_used']}B(基址 0x{gbase:08x})", file=sys.stderr)
+                for mn, c in sorted(hist.items(), key=lambda kv: (-kv[1], kv[0])):
+                    print(f"       {mn:<10} {c}", file=sys.stderr)
             if a.disasm:
                 asm = assembly.assemble(text)
                 sys.stderr.write(assembly.disasm_report(asm, asm.flags(0)))

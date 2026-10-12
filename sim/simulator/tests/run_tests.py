@@ -619,12 +619,39 @@ def main():
         check("sg: relu_swap 的 64 个字与参考(out[off+i]=|in[off+31-i]|)逐位一致(证明 bar() 真的同步了跨 warp 数据)",
               got == exp, "不符 %d 个" % sum(1 for a2, b2 in zip(got, exp) if a2 != b2))
 
+    # ③b mask_low.sg: 位运算 / 移位 / 短路条件(语言 v0.3 新增的能力)
+    sg_mask = os.path.join(OUT, "sg_mask_low.bin")
+    sg_maskS = os.path.join(OUT, "sg_mask_low.S")
+    rc, out = sg_run([os.path.join(SG_DIR, "mask_low.sg"), "--image", sg_mask, "-o", sg_maskS, "-q"])
+    check("sg: mask_low.sg 编译通过(& | >>> + || 短路 + if/else)",
+          rc == 0 and os.path.exists(sg_mask), out[-300:])
+    if rc == 0:
+        text = open(sg_maskS).read()
+        check("sg: 位运算走立即形式(andi/ori/srli), 不退化成「先装常量再运算」",
+              all(m in text for m in ("andi ", "ori ", "srli ")), text[-200:])
+        N = 32
+        rnd = __import__("random").Random(11)
+        vals = [rnd.getrandbits(32) for _ in range(64)]
+        ww = []
+        for i, v in enumerate(vals):
+            ww += ["--write-word", "0x%08x=0x%08x" % (0x10000000 + i * 4, v)]
+        dm = os.path.join(OUT, "sg_mask_out.txt")
+        run([sg_mask, "--warps", "4", "--no-check", "--param", "0=0x10000000", "--param", "4=%d" % N]
+            + ww + ["--dump", "0x10000000,64," + dm])
+        got = [l.split()[1].replace("0x", "") for l in open(dm)] if os.path.exists(dm) else []
+        exp = []
+        for i, v in enumerate(vals):
+            if i < N and v != 0:
+                v = ((v & 0xFF) | 0x80) if (i % 2 == 0) else (v >> 1)   # >>> 是逻辑右移
+            exp.append("%08x" % v)
+        check("sg: mask_low 的 64 个字与参考逐位一致(含 >>> 的逻辑右移语义)",
+              got == exp, "不符 %d 个" % sum(1 for a2, b2 in zip(got, exp) if a2 != b2))
+
     # ③ 错误码: grammer.md §9 的 14 条都要能真的报出来(每条一个最小反例)
     NEG = [
         ("E001", "寄存器溢出", "const -: 0x02000000\nkernel k\n" +
          "\n".join("    var v%d" % i for i in range(1, 33)) + "\nend\n"),
-        ("E002", "谓词溢出", "const -: 0x02000000\nkernel k\n    var a, b, c, d, e, f, g, h\n"
-         "    when a < b : when c < d : when e < f : when g < h : a = 1\nend\n"),
+        # E002 不在表里: 见下面的"保留但不可达"断言
         ("E003", "未知指令/函数", "kernel k\n    var a\n    a = nosuch(1)\nend\n"),
         ("E004", "类型不匹配", "kernel k\n    var a : int\n    var b : float\n    a = b\nend\n"),
         ("E005", "循环次数非标量", "const -: 0x02000000\nkernel k\n    var i, N\n"
@@ -652,8 +679,29 @@ def main():
         rc, out = sg_run([path, "--image", os.path.join(OUT, "sg_neg_%s.bin" % code), "-q"])
         if rc == 0 or code not in out:
             bad.append("%s(%s)" % (code, why))
-    check("sg: grammer.md §9 的 %d 个错误码都有能触发的反例" % len(NEG), not bad,
+    check("sg: grammer.md 错误码表里 %d 个可触发码都有反例" % len(NEG), not bad,
           "未触发/未报对: " + ", ".join(bad))
+
+    # ④ 代码生成质量护栏: 这三条优化一旦丢失, 指令数会明显回升
+    counts = {}
+    for name in ("clear", "abs", "relu_swap"):
+        _, o = sg_run([os.path.join(SG_DIR, name + ".sg"), "--stats", "-q",
+                       "--image", os.path.join(OUT, "sg_c_%s.bin" % name)])
+        m = re.search(r"汇编后共 (\d+) 条指令", o)
+        counts[name] = int(m.group(1)) if m else -1
+    check("sg: 代码生成不退化(clear %d≤34 / abs %d≤22 / relu_swap %d≤52)"
+          % (counts["clear"], counts["abs"], counts["relu_swap"]),
+          counts["clear"] <= 34 and counts["abs"] <= 22 and counts["relu_swap"] <= 52, str(counts))
+
+    # E002 保留但不可达(与 ISA §2.6 的 SIMT_OVF 同一类): 复合/嵌套条件已改走分支,
+    # 只有一个 when 会长期占住谓词 ⇒ 三层嵌套 when 现在能正常编译
+    nest = ("const -: 0x02000000\nkernel k\n    var a, b, c, d, e, f, g, h\n"
+            "    when a < b : when c < d : when e < f : h = 1\n    exit\nend\n")
+    np2 = os.path.join(OUT, "sg_neg_E002b.sg")
+    open(np2, "w").write(nest)
+    rc, out = sg_run([np2, "--image", os.path.join(OUT, "sg_neg_E002b.bin"), "-q"])
+    check("sg: E002(谓词溢出)保留但不可达: 三层嵌套 when 改走分支, 谓词不再累积",
+          rc == 0 and "E002" not in out, out[-200:])
 
     npass = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 70)

@@ -138,12 +138,15 @@ for name, d in docs.items():
     appidx = [i for i, l in enumerate(d["lines"]) if re.match(r"^##\s*附录", l)]
     app = appidx[-1] if appidx else 0
     body = d["lines"][app:]
-    # 按 `### vX → vY` 分节: 每节内编号必须唯一且递增(节与节之间允许倒序/正序两套排法)
+    # 只在"变更记录"小节里找编号行: 否则正文里的 `### 4.1` 之类会被当成变更记录小节,
+    # "整份附录丢失"这种事故就会被误判为通过(grammer.md 漏过一次)。
     secs, cur = [], None
     for line in body:
-        if line.startswith("### "):
+        if line.startswith("### ") and ('→' in line or '变更' in line):
             cur = []
             secs.append((line.strip(), cur))
+        elif line.startswith("### "):
+            cur = None                       # 不是变更记录的小节 ⇒ 不收集编号
         elif cur is not None and line.startswith("|"):
             first = line.strip("|").split("|")[0].strip()
             if re.fullmatch(r"[0-9]+", first):
@@ -162,10 +165,12 @@ for name, d in docs.items():
             num_bad.append("%s %s 编号重复或逆序: %s" % (name, title, ns))
         nums += ns
     if not secs:
-        num_bad.append("%s 没有可识别的变更记录小节" % name)
+        num_bad.append("%s 没有 `变更记录` 小节(每份文档都必须有一条 vX → vY 变更表)" % name)
+    elif not nums:
+        num_bad.append("%s 的变更记录小节里没有编号行" % name)
     elif len(nums) != len(set(nums)):
         num_bad.append("%s 各节编号跨节重复: %s" % (name, sorted(nums)))
-check("四份文档的变更记录: 每节编号唯一递增、跨节不重复", not num_bad, "; ".join(num_bad))
+check("每次文档变更记录: 每节编号唯一递增、跨节不重复", not num_bad, "; ".join(num_bad))
 
 print("\n== ④ 被引用的仓库路径是否存在 ==")
 PROPOSAL = ("建议", "待实现", "待定", "若", "计划", "预留", "拟", "尚未", "提案", "未实现",

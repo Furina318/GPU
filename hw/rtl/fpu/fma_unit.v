@@ -28,6 +28,13 @@ module fma_unit #(
     input  wire                flush      ,
     input  wire [ID_WIDTH-1:0] flush_id   ,
 
+    // 写回握手: 仲裁器每拍只放行一个写回, 取走 p2 结果的那一拍拉高 wb_ack。
+    // 未获授权时 p2 必须保持 (整条流水线冻结), 否则结果被永久丢弃
+    input  wire                wb_ack     ,
+
+    // 流水线冻结中 (p2 结果待取走): 此时不能再接收新指令
+    output wire                busy_o     ,
+
     output wire                wb_valid   ,
     output wire [ID_WIDTH-1:0] wb_id      ,
     output wire [        31:0] wb_result  ,
@@ -247,7 +254,30 @@ module fma_unit #(
         end
     endfunction
 
-    wire new_flushed = flush && is_younger(issue_id, flush_id);
+    // 写回保持 (wb_stall) 与 flush 锁存
+    wire wb_stall = p2_valid & ~wb_ack;
+
+    assign busy_o = wb_stall;
+
+    reg                flush_hold;
+    reg [ID_WIDTH-1:0] flush_id_hold;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            flush_hold    <= 1'b0;
+            flush_id_hold <= {ID_WIDTH{1'b0}};
+        end else if (flush) begin
+            flush_hold    <= 1'b1;
+            flush_id_hold <= flush_id;
+        end else if (!wb_stall && !p0_valid && !p1_valid) begin
+            flush_hold <= 1'b0;
+        end
+    end
+
+    wire                flush_eff    = flush | flush_hold;
+    wire [ID_WIDTH-1:0] flush_id_eff = flush ? flush_id : flush_id_hold;
+
+    wire new_flushed = flush_eff && is_younger(issue_id, flush_id_eff);
 
     always @(posedge clk) begin
         if (rst) begin
@@ -286,9 +316,11 @@ module fma_unit #(
             p1_p_off        <= 1'b0;
             p1_c_off        <= 1'b0;
             p1_base      <= 11'sd0;
+        end else if (wb_stall) begin
+            // p2 的结果还没被取走: 冻结 p0/p1
         end else begin
             p1_valid      <= p0_valid;
-            p1_flushed    <= p0_flushed | (flush & p0_valid & is_younger(p0_id, flush_id));
+            p1_flushed    <= p0_flushed | (flush_eff & p0_valid & is_younger(p0_id, flush_id_eff));
             p1_id         <= p0_id;
             p1_rm         <= p0_rm;
             p1_is_special <= p0_is_special;
@@ -547,9 +579,11 @@ module fma_unit #(
             p2_deep_pos  <= 1'b0;
             p2_cross_exact <= 1'b0;
             p2_base      <= 11'sd0;
+        end else if (wb_stall) begin
+            // p2 的结果还没被取走: 冻结 p2
         end else begin
             p2_valid      <= p1_valid;
-            p2_flushed    <= p1_flushed | (flush & p1_valid & is_younger(p1_id, flush_id));
+            p2_flushed    <= p1_flushed | (flush_eff & p1_valid & is_younger(p1_id, flush_id_eff));
             p2_id         <= p1_id;
             p2_rm         <= p1_rm;
             p2_is_special <= p1_is_special;
@@ -639,8 +673,8 @@ module fma_unit #(
         end
         if (sub_inexact) begin
             sub_fflags[`NX] = 1'b1;
-            // 用"指数无界"的舍入结果判定 tiny 
-            if (norm_exp_final < -13'sd126)
+            // 用"指数无界"的舍入结果判定 tiny
+            if (norm_exp_final < -13'sd126 && !sub_to_normal)
                 sub_fflags[`UF] = 1'b1;
         end
     end

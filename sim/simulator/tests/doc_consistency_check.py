@@ -27,7 +27,9 @@ SIMDIR = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(SIMDIR))
 DOCS = os.path.join(REPO, "docs")
 
-DOC_NAMES = ["ISA.md", "CMDS.md", "SPEC.md", "GFX.md"]
+# docs/ 里的四份架构文档 + 语言规格 sw/grammer.md(它同样引用 ISA/CMDS 的章节)
+DOC_NAMES = ["ISA.md", "CMDS.md", "SPEC.md", "GFX.md", "grammer.md"]
+DOC_DIRS = {"grammer.md": os.path.join(REPO, "sw")}
 ALIAS = {"ISA": "ISA.md", "CMDS": "CMDS.md", "SPEC": "SPEC.md", "GFX": "GFX.md"}
 
 fails = []
@@ -69,7 +71,7 @@ def headings(text):
 # ---------------------------------------------------------------- 读取文档
 docs = {}
 for name in DOC_NAMES:
-    p = os.path.join(DOCS, name)
+    p = os.path.join(DOC_DIRS.get(name, DOCS), name)
     if not os.path.exists(p):
         check("%s 存在" % name, False, p)
         continue

@@ -105,6 +105,7 @@ module fpu #(
     );
 
     // 浮点乘-加融合单元
+    wire        fma_busy;
     wire        fma_wb_valid;
     wire [ID_WIDTH-1:0] fma_wb_id;
     wire [31:0] fma_result;
@@ -115,7 +116,7 @@ module fpu #(
     ) u_fma_unit (
         .clk         (clk            ),
         .rst         (rst            ),
-        .issue_valid (valid & is_fmac),
+        .issue_valid (valid & ready & is_fmac),
         .issue_id    (fpu_id         ),
         .op          (fpu_op         ),
         .rm          (rm             ),
@@ -142,6 +143,8 @@ module fpu #(
         .s3_snan     (snan_c         ),
         .flush       (flush          ),
         .flush_id    (flush_id       ),
+        .wb_ack      (arb_grant[0]   ),
+        .busy_o      (fma_busy        ),
         .wb_valid    (fma_wb_valid   ),
         .wb_id       (fma_wb_id      ),
         .wb_result   (fma_result     ),
@@ -214,6 +217,7 @@ module fpu #(
     );
 
     // 除法单元（单拍组合除法 + 下一拍锁存写回）
+    wire        fdiv_busy;
     wire        fdiv_wb_valid;
     wire [ID_WIDTH-1:0] fdiv_wb_id;
     wire [31:0] fdiv_result;
@@ -224,7 +228,7 @@ module fpu #(
     ) u_fdiv (
         .clk         (clk            ),
         .rst         (rst            ),
-        .issue_valid (valid & is_fdiv),
+        .issue_valid (valid & ready & is_fdiv),
         .issue_id    (fpu_id         ),
         .op          (fpu_op         ),
         .rm          (rm             ),
@@ -244,6 +248,8 @@ module fpu #(
         .s2_snan     (snan_b         ),
         .flush       (flush          ),
         .flush_id    (flush_id       ),
+        .busy_o      (fdiv_busy      ),
+        .wb_ack      (arb_grant[3]   ),
         .wb_valid    (fdiv_wb_valid  ),
         .wb_id       (fdiv_wb_id     ),
         .wb_result   (fdiv_result    ),
@@ -251,6 +257,7 @@ module fpu #(
     );
 
     // 平方根单元
+    wire        fsqrt_busy;
     wire        fsqrt_wb_valid;
     wire [ID_WIDTH-1:0] fsqrt_wb_id;
     wire [31:0] fsqrt_result;
@@ -261,7 +268,7 @@ module fpu #(
     ) u_fsqrt (
         .clk         (clk            ),
         .rst         (rst            ),
-        .issue_valid (valid & is_fsqrt),
+        .issue_valid (valid & ready & is_fsqrt),
         .issue_id    (fpu_id         ),
         .rm          (rm             ),
         .s1_sign     (sign_a         ),
@@ -273,6 +280,8 @@ module fpu #(
         .s1_snan     (snan_a         ),
         .flush       (flush          ),
         .flush_id    (flush_id       ),
+        .busy_o      (fsqrt_busy     ),
+        .wb_ack      (arb_grant[4]   ),
         .wb_valid    (fsqrt_wb_valid ),
         .wb_id       (fsqrt_wb_id    ),
         .wb_result   (fsqrt_result   ),
@@ -280,34 +289,106 @@ module fpu #(
     );
 
     // 写回仲裁,年龄优先
-    wire [4:0] arb_valid = {fsqrt_wb_valid, fdiv_wb_valid, fcvt_wb_valid, fquick_wb_valid, fma_wb_valid};
+    // fquick 和 fcvt指令保留
+    reg                qk_pend_valid;
+    reg [ID_WIDTH-1:0] qk_pend_id;
+    reg [31:0]         qk_pend_data;
+    reg [4:0]          qk_pend_fflags;
 
-    wire fquick_wb_valid = valid & is_fquick & ~flush;
-    wire fcvt_wb_valid   = valid & is_fcvt   & ~flush;
+    reg                cv_pend_valid;
+    reg [ID_WIDTH-1:0] cv_pend_id;
+    reg [31:0]         cv_pend_data;
+    reg [4:0]          cv_pend_fflags;
+
+    // 与 fma_unit 一致的冲刷判定: flush 取消 id 比 flush_id 更年轻的指令;
+    // 仲裁器自身是按 id == flush_id 屏蔽的, 所以这里两者都覆盖。
+    function automatic id_flushed;
+        input [ID_WIDTH-1:0] a;
+        input                fl;
+        input [ID_WIDTH-1:0] fid;
+        reg                  younger;
+        begin
+            younger = (a != fid) &&
+                ((a[ID_WIDTH-1] ^ fid[ID_WIDTH-1]) ? (a[ID_WIDTH-2:0] < fid[ID_WIDTH-2:0])
+                                                   : (a[ID_WIDTH-2:0] > fid[ID_WIDTH-2:0]));
+            id_flushed = fl && ((a == fid) || younger);
+        end
+    endfunction
+
+    // 写回确认: 仲裁器的授予向量, 按端口编号对齐 arb_valid
+    wire qk_ack = arb_grant[1];
+    wire cv_ack = arb_grant[2];
+
+    wire qk_issue = valid & ready & is_fquick & ~flush;
+    wire cv_issue = valid & ready & is_fcvt   & ~flush;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            qk_pend_valid  <= 1'b0;
+            qk_pend_id     <= {ID_WIDTH{1'b0}};
+            qk_pend_data   <= 32'd0;
+            qk_pend_fflags <= 5'd0;
+            cv_pend_valid  <= 1'b0;
+            cv_pend_id     <= {ID_WIDTH{1'b0}};
+            cv_pend_data   <= 32'd0;
+            cv_pend_fflags <= 5'd0;
+        end else begin
+            // 被冲刷的结果直接丢弃
+            if (id_flushed(qk_pend_id, flush, flush_id)) qk_pend_valid <= 1'b0;
+            if (id_flushed(cv_pend_id, flush, flush_id)) cv_pend_valid <= 1'b0;
+            // 被仲裁器取走则释放
+            if (qk_ack) qk_pend_valid <= 1'b0;
+            if (cv_ack) cv_pend_valid <= 1'b0;
+            // 新结果锁存, 放在最后, 使"同拍释放并接收"正确生效
+            if (qk_issue) begin
+                qk_pend_valid  <= 1'b1;
+                qk_pend_id     <= fpu_id;
+                qk_pend_data   <= fquick_result;
+                qk_pend_fflags <= fquick_fflags_final;
+            end
+            if (cv_issue) begin
+                cv_pend_valid  <= 1'b1;
+                cv_pend_id     <= fpu_id;
+                cv_pend_data   <= fcvt_result;
+                cv_pend_fflags <= fcvt_fflags;
+            end
+        end
+    end
+
+    // 只有"空闲 或 本拍被取走"时才允许接收新结果, 否则会覆盖尚未写回的旧值
+    wire qk_free = ~qk_pend_valid | qk_ack;
+    wire cv_free = ~cv_pend_valid | cv_ack;
+
+    wire fquick_wb_valid = qk_pend_valid;
+    wire fcvt_wb_valid   = cv_pend_valid;
+
+    wire [4:0] arb_valid = {fsqrt_wb_valid, fdiv_wb_valid, fcvt_wb_valid, fquick_wb_valid, fma_wb_valid};
 
     wire [5*32-1:0]        arb_data;
     wire [5*5-1:0]         arb_fflags;
     wire [5*ID_WIDTH-1:0]  arb_id;
 
     assign arb_data[32*0 +: 32]   = fma_result;
-    assign arb_data[32*1 +: 32]   = fquick_result;
-    assign arb_data[32*2 +: 32]   = fcvt_result;
+    assign arb_data[32*1 +: 32]   = qk_pend_data;
+    assign arb_data[32*2 +: 32]   = cv_pend_data;
     assign arb_data[32*3 +: 32]   = fdiv_result;
     assign arb_data[32*4 +: 32]   = fsqrt_result;
 
     assign arb_fflags[5*0 +: 5] = fma_fflags;
-    assign arb_fflags[5*1 +: 5] = fquick_fflags_final;
-    assign arb_fflags[5*2 +: 5] = fcvt_fflags;
+    assign arb_fflags[5*1 +: 5] = qk_pend_fflags;
+    assign arb_fflags[5*2 +: 5] = cv_pend_fflags;
     assign arb_fflags[5*3 +: 5] = fdiv_fflags;
     assign arb_fflags[5*4 +: 5] = fsqrt_fflags;
 
     assign arb_id[ID_WIDTH*0 +: ID_WIDTH] = fma_wb_id;
-    assign arb_id[ID_WIDTH*1 +: ID_WIDTH] = fpu_id;
-    assign arb_id[ID_WIDTH*2 +: ID_WIDTH] = fpu_id;
+    assign arb_id[ID_WIDTH*1 +: ID_WIDTH] = qk_pend_id;
+    assign arb_id[ID_WIDTH*2 +: ID_WIDTH] = cv_pend_id;
     assign arb_id[ID_WIDTH*3 +: ID_WIDTH] = fdiv_wb_id;
     assign arb_id[ID_WIDTH*4 +: ID_WIDTH] = fsqrt_wb_id;
 
-    wire [4:0] arb_grant_unused;
+    // 授予向量同时就是各写回源的确认信号: grant_o 只在 best_valid 时非零,
+    // 所以 grant[i] 蕴含 wb_valid_o=1。
+    wire [4:0] arb_grant;
     fpu_arbiter #(
         .NUM_PORTS  (5),
         .ID_WIDTH   (ID_WIDTH),
@@ -317,7 +398,7 @@ module fpu #(
         .req_id_i    (arb_id          ),
         .req_data_i  (arb_data        ),
         .req_fflags_i(arb_fflags      ),
-        .grant_o     (arb_grant_unused),
+        .grant_o     (arb_grant       ),
         .wb_valid_o  (fpu_valid       ),
         .wb_id_o     (fpu_id_o        ),
         .wb_data_o   (fpu_result      ),
@@ -326,6 +407,12 @@ module fpu #(
         .flush_id    (flush_id        )
     );
 
-    assign ready = 1'b1;
+    wire op_is_div  = (fpu_op == `FDIV_S );
+    wire op_is_sqrt = (fpu_op == `FSQRT_S);
+
+    assign ready = (~op_is_div  | ~fdiv_busy ) &
+                   (~op_is_sqrt | ~fsqrt_busy) &
+                   ~fma_busy &
+                   qk_free & cv_free;
 
 endmodule

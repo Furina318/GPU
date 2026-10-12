@@ -1,0 +1,21 @@
+const -: 0x02000000
+
+kernel abs
+    var base, N, idx, addr
+    var x : float
+
+    param base : int @const[0]
+    param N    : int @const[4]
+    idx = tid() + wid() * 8
+    
+    when idx >= N goto done
+
+    addr = base + idx * 4
+    x    = ldx(addr)
+    when x < 0.0 : x = -x
+    stx(addr, x)
+
+done:
+    exit
+
+end

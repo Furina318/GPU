@@ -88,9 +88,9 @@ module fcvt (
             // 右移 (23 - src_exp) 位得到整数截断值 f2i_mag，
             // 同时提取舍入位 G/R/S（小数点右侧的第一/第二/其余位）
             if (src_exp >= 9'sd23) begin
-                // 整数部分可能很大；超过 64bit 时直接饱和，交给溢出判断
-                if (src_exp > 9'sd86) begin
-                    f2i_mag = 64'hffffffffffffffff;
+                // 整数部分可能很大，超出 64bit 时必须饱和，交给下面的溢出判断。
+                if (src_exp > 9'sd63) begin
+                    f2i_mag = 64'h0000000100000000;
                 end else begin
                     f2i_mag = {40'd0, src_sig} << (src_exp - 9'sd23);
                 end

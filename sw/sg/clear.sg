@@ -1,0 +1,26 @@
+# 注释区
+const -: 0x02000000 #设定地址
+fb    -: 0x10000000
+
+kernel clear
+    var N, color, stride, idx, addr, T, i
+
+    param N      : int @const[0]
+    param color  : int @const[4]
+    param stride : int @const[8] 
+    idx    = tid() + wid() * 8
+    addr   = @fb + idx * 4
+    T      = ceildiv(N, stride)
+
+    when T == 0 goto done
+
+    i = 0
+loop:
+    when idx < N: stx(addr, color)
+    addr = addr + stride * 4
+    idx  = idx + stride
+    i    = i + 1
+    when i != T goto loop
+done:
+    exit
+end

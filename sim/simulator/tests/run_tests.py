@@ -509,8 +509,13 @@ def main():
 
     print("\n== ⑫ car demo: 2D 引擎路径 vs 逐像素 shader, 同一幅画 ==")
     CAR = os.path.join(SIMDIR, "build", "car")
+    if not os.path.exists(CAR):
+        check("car demo: 二进制存在(直接跑 tests/run_tests.py 时需要先 `make demo`)", False, CAR)
+        CAR = None
 
-    def car_run(args, frames=80):        # 80 帧 > 环容量/帧开销 ⇒ 一定跨过多次队列回绕(守 64B 补齐)
+    def car_run(args, frames=80):
+        if CAR is None:
+            return 1, "build/car 不存在"         # 80 帧 > 环容量/帧开销 ⇒ 一定跨过多次队列回绕(守 64B 补齐)
         p = subprocess.run([CAR, "--frames", str(frames), "--fps", "0"] + args,
                            capture_output=True, text=True, timeout=300)
         return p.returncode, p.stdout + p.stderr
@@ -528,6 +533,127 @@ def main():
     c_2d, c_sh = car_cycles([]), car_cycles(["--shader"])
     check("car: 2D 引擎把像素工作从 SM 手里拿走(%d 周期/帧 vs 逐像素 %d 周期/帧)" % (c_2d, c_sh),
           0 < c_2d < c_sh // 50, "2D=%d shader=%d" % (c_2d, c_sh))
+
+    print("\n== ⑬ sg 编译器(sw/compiler.py + sw/grammer.md): 编译产物 ≡ 手写内核 ==")
+    COMPILER = os.path.join(REPO, "sw", "compiler.py")
+    SG_DIR = os.path.join(REPO, "sw", "sg")
+
+    def sg_run(argv, timeout=120):
+        p = subprocess.run([sys.executable, COMPILER] + argv, capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode, p.stdout + p.stderr
+
+    # ① clear.sg: 与手写 clear.S 画同一幅画面(4096 像素逐位比对)
+    sg_clear = os.path.join(OUT, "sg_clear.bin")
+    rc, out = sg_run([os.path.join(SG_DIR, "clear.sg"), "--image", sg_clear, "-q"])
+    check("sg: clear.sg 编译 + 汇编通过", rc == 0 and os.path.exists(sg_clear), out[-300:])
+    if rc == 0:
+        params = ["--param", "0=4096", "--param", "4=0xff00ff00", "--param", "8=32",
+                  "--warps", "4", "--no-check"]
+        d_hw = os.path.join(OUT, "sg_clear_hw.txt")
+        d_sg = os.path.join(OUT, "sg_clear_me.txt")
+        run([os.path.join(OUT, "clear.bin")] + params + ["--dump", "0x10000000,4096," + d_hw])
+        run([sg_clear] + params + ["--dump", "0x10000000,4096," + d_sg])
+        same = (os.path.exists(d_hw) and os.path.exists(d_sg) and
+                open(d_hw).read() == open(d_sg).read())
+        check("sg: clear.sg 的产物与手写 clear.S 的 4096 像素逐位一致", same)
+
+    # ② abs.sg: 与手写 abs.S 逐字比对(输入含 -0.0 / +0.0 / NaN, 都是容易写错的边界)
+    sg_abs = os.path.join(OUT, "sg_abs.bin")
+    rc, out = sg_run([os.path.join(SG_DIR, "abs.sg"), "--image", sg_abs, "-q"])
+    check("sg: abs.sg 编译 + 汇编通过(float 比较 + 谓词化取负)", rc == 0 and os.path.exists(sg_abs),
+          out[-300:])
+    if rc == 0:
+        hw_abs = os.path.join(OUT, "sg_abs_hw.bin")
+        assemble(os.path.join(REPO, "sw/kernels/abs.S"), hw_abs)
+        ww = []
+        for i in range(32):
+            if i == 0:      x = -0.0
+            elif i == 1:    x = 0.0
+            elif i == 2:    x = float("nan")
+            else:           x = float((i % 7) - 3) * (-1.0 if (i & 1) else 1.0) + 0.25
+            ww += ["--write-word", "0x%08x=0x%08x" % (0x10000000 + i * 4,
+                                                      struct.unpack("<I", struct.pack("<f", x))[0])]
+        base = ["--warps", "4", "--no-check", "--param", "0=0x10000000", "--param", "4=32"]
+        d_hw = os.path.join(OUT, "sg_abs_hw.txt")
+        d_sg = os.path.join(OUT, "sg_abs_me.txt")
+        run([hw_abs] + base + ww + ["--dump", "0x10000000,32," + d_hw])
+        run([sg_abs] + base + ww + ["--dump", "0x10000000,32," + d_sg])
+        same = (os.path.exists(d_hw) and os.path.exists(d_sg) and
+                open(d_hw).read() == open(d_sg).read())
+        check("sg: abs.sg 的产物与手写 abs.S 的 32 个字逐位一致(-0.0 不算负、NaN 不被取负)", same)
+
+    # ②b §6.4 的谓词化范围: `when` 体内的**载入**也要屏蔽(否则屏蔽 lane 会发出越界/未对齐请求)
+    when_src = ("const -: 0x02000000\nkernel k\n    var N, idx, addr\n    var x : float\n"
+                "    param base : int @const[0]\n    param N    : int @const[4]\n"
+                "    idx  = tid() + wid() * 8\n    addr = base + idx * 4\n"
+                "    when idx < N : x = ldx(addr)\n    exit\nend\n")
+    when_sg = os.path.join(OUT, "sg_when.sg")
+    when_S = os.path.join(OUT, "sg_when.S")
+    open(when_sg, "w").write(when_src)
+    rc, out = sg_run([when_sg, "-o", when_S, "-q"])
+    text = open(when_S).read() if os.path.exists(when_S) else ""
+    check("sg: when 体内的载入被谓词化(@p1 ld.g), 屏蔽 lane 不发访存请求",
+          rc == 0 and "@p1 ld.g" in text, text[-200:])
+
+    # ③ relu_swap.sg: 共享内存 + 两次 bar() + while 循环 + 谓词化跨 lane 读
+    sg_relu = os.path.join(OUT, "sg_relu_swap.bin")
+    rc, out = sg_run([os.path.join(SG_DIR, "relu_swap.sg"), "--image", sg_relu, "-q"])
+    check("sg: relu_swap.sg 编译通过(shared/bar/while/谓词化跨 lane 访存)", rc == 0 and os.path.exists(sg_relu),
+          out[-300:])
+    if rc == 0:
+        N = 64
+        rnd = __import__("random").Random(7)
+        vals = [rnd.uniform(-4.0, 4.0) for _ in range(N)]
+        ww = []
+        for i, v in enumerate(vals):
+            ww += ["--write-word",
+                   "0x%08x=0x%08x" % (0x10000000 + i * 4,
+                                      struct.unpack("<I", struct.pack("<f", v))[0])]
+        d = os.path.join(OUT, "sg_relu_out.txt")
+        rc2, out2 = run([sg_relu, "--warps", "4", "--no-check", "--param", "0=0x10000000",
+                         "--param", "4=%d" % N] + ww + ["--dump", "0x10000000,%d,%s" % (N, d)])
+        got = [l.split()[1].replace("0x", "") for l in open(d)] if os.path.exists(d) else []
+        exp = ["%08x" % struct.unpack("<I", struct.pack("<f", abs(vals[(i // 32) * 32 + 31 - (i % 32)])))[0]
+               for i in range(N)]
+        check("sg: relu_swap 的 64 个字与参考(out[off+i]=|in[off+31-i]|)逐位一致(证明 bar() 真的同步了跨 warp 数据)",
+              got == exp, "不符 %d 个" % sum(1 for a2, b2 in zip(got, exp) if a2 != b2))
+
+    # ③ 错误码: grammer.md §9 的 14 条都要能真的报出来(每条一个最小反例)
+    NEG = [
+        ("E001", "寄存器溢出", "const -: 0x02000000\nkernel k\n" +
+         "\n".join("    var v%d" % i for i in range(1, 33)) + "\nend\n"),
+        ("E002", "谓词溢出", "const -: 0x02000000\nkernel k\n    var a, b, c, d, e, f, g, h\n"
+         "    when a < b : when c < d : when e < f : when g < h : a = 1\nend\n"),
+        ("E003", "未知指令/函数", "kernel k\n    var a\n    a = nosuch(1)\nend\n"),
+        ("E004", "类型不匹配", "kernel k\n    var a : int\n    var b : float\n    a = b\nend\n"),
+        ("E005", "循环次数非标量", "const -: 0x02000000\nkernel k\n    var i, N\n"
+         "    param N : int @const[0]\n    i = tid()\n    while i < N:\n        i = i + 1\n    end\n"
+         "    exit\nend\n"),
+        ("E006", "发散路径里 bar()", "const -: 0x02000000\nkernel k\n    var i, N\n"
+         "    param N : int @const[0]\n    i = tid()\n    if i < N:\n        bar()\n    end\n"
+         "    exit\nend\n"),
+        ("E007", "未定义标签", "kernel k\n    var a\n    a = 0\n    goto nowhere\nend\n"),
+        ("E008", "重复定义标签", "kernel k\n    var a\n    a = 0\nl:\nl:\n    exit\nend\n"),
+        ("E009", "未定义符号", "kernel k\n    var N\n    param N : int @nosuch[0]\n    exit\nend\n"),
+        ("E010", "未对齐地址", "const -: 0x02000000\nkernel k\n    var N\n"
+         "    param N : int @const[2]\n    exit\nend\n"),
+        ("E011", "共享内存溢出", "kernel k\n    __shared__ t : int[5000] shared\n    var a\n"
+         "    a = t[0]\n    bar()\n    exit\nend\n"),
+        ("E012", "FP 除法/开方", "kernel k\n    var a, b, c : float\n    c = a / b\n    exit\nend\n"),
+        ("E013", "共享内存跨 warp 未同步", "kernel k\n    __shared__ t : int[8] shared\n    var a\n"
+         "    a = t[0]\n    exit\nend\n"),
+        ("E014", "插入指令非法", "kernel k\n    var a\n    ass foo r1, r2\n    exit\nend\n"),
+    ]
+    bad = []
+    for code, why, src in NEG:
+        path = os.path.join(OUT, "sg_neg_%s.sg" % code)
+        open(path, "w").write(src)
+        rc, out = sg_run([path, "--image", os.path.join(OUT, "sg_neg_%s.bin" % code), "-q"])
+        if rc == 0 or code not in out:
+            bad.append("%s(%s)" % (code, why))
+    check("sg: grammer.md §9 的 %d 个错误码都有能触发的反例" % len(NEG), not bad,
+          "未触发/未报对: " + ", ".join(bad))
 
     npass = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 70)

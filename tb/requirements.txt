@@ -1,0 +1,12 @@
+# Python dependencies for the cocotb testbenches under tb/.
+#
+# cocotb 2.x requires a simulator that is EITHER newer than Verilator 5.036
+# (its VPI shim calls VerilatedVpi::clearEvalNeeded / doInertialPuts) or a
+# simulator with its own VPI (Icarus, Questa, ...).  `make -C tb setup` installs
+# the pinned Verilator from PyPI into tb/.tools, so it does not appear here.
+cocotb>=2.0,<3.0
+
+# Optional, not installed by default (see tb/UVM.md section 4):
+#   cocotb-coverage     functional coverage bins
+#   cocotbext-axi       AXI4 protocol VIP, for the SoC-level work
+#   pytest              for running cocotb tests through pytest instead of run.py

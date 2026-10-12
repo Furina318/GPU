@@ -33,7 +33,7 @@ LIB_OBJS := $(patsubst %.cpp,$(OBJDIR)/%.o,$(LIB_SRCS))
 DEMOS     := anim car
 DEMO_BINS := $(addprefix $(BUILD)/,$(DEMOS))
 
-.PHONY: all run run-all debug dbg-all check test images demo anim car car-shader clean help
+.PHONY: all run run-all debug dbg-all check test images sg demo anim car car-shader clean help
 
 all: $(BUILD)/simulator $(DEMO_BINS)
 
@@ -46,6 +46,7 @@ help:
 	@echo "make car [DEMO_ARGS=...]                                小汽车 demo(精灵搬移)"
 	@echo "make demo                                               只编译 demo(不运行)"
 	@echo "make images                                             只汇编出镜像"
+	@echo "make sg                                                 sw/sg/*.sg → build/sg/*.bin(compiler.py)"
 	@echo "make clean"
 
 ## make run KERNEL=matmul ARGS="--log run.log --trace"
@@ -96,6 +97,16 @@ test: $(BUILD)/simulator $(BUILD)/anim $(BUILD)/car $(BUILD)/car.bin $(BUILD)/ca
 	python3 tests/run_tests.py
 
 images: $(IMAGES)
+
+## make sg → 把 sw/sg/*.sg 用 sw/compiler.py(grammer.md)编译成内核镜像 build/sg/*.bin
+SG_SRCS := $(wildcard ../../sw/sg/*.sg)
+SG_BINS := $(patsubst ../../sw/sg/%.sg,$(BUILD)/sg/%.bin,$(SG_SRCS))
+
+sg: $(SG_BINS)
+
+$(BUILD)/sg/%.bin: ../../sw/sg/%.sg ../../sw/compiler.py | $(BUILD)
+	@mkdir -p $(BUILD)/sg
+	python3 ../../sw/compiler.py $< --image $@
 
 $(BUILD)/%.bin: ../../sw/kernels/%.S $(ASM) | $(BUILD)
 	python3 $(ASM) $< --format image -o $@

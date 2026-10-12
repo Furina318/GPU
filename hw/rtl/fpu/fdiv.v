@@ -23,6 +23,14 @@ module fdiv #(
     input  wire                flush      ,
     input  wire [ID_WIDTH-1:0] flush_id   ,
 
+    // 单槽单元的反压: busy 期间 fstart 会被 ~busy 抑制，
+    // 调用方必须据此拒发，否则请求被静默丢弃
+    output wire                busy_o     ,
+
+    // 写回握手: 仲裁器每拍只放行一个写回, 取走本单元结果的那一拍拉高 wb_ack。
+    // 未获授权时 wb_valid 必须保持, 否则结果会被永久丢弃
+    input  wire                wb_ack     ,
+
     output wire                wb_valid   ,
     output wire [ID_WIDTH-1:0] wb_id      ,
     output wire [        31:0] wb_result  ,
@@ -211,8 +219,7 @@ module fdiv #(
     wire [24:0] sub_N_raw = (sub_rsh <= 10'sd25) ? (quo >> sub_rsh[4:0]) : 25'd0;
     wire [23:0] sub_N = sub_N_raw[23:0];
 
-    wire        sub_shifted_sticky = (sub_rsh <= 10'sd25) ? sub_shift_sticky(sub_rsh[4:0], quo) : |quo;
-    wire        sub_sticky_all = div_sticky | sub_shifted_sticky;
+    wire        sub_sticky_below = sub_in_window ? sub_sticky_drop : (|quo);
 
     wire [22:0] sub_frac = sub_N[22:0];
 
@@ -222,12 +229,15 @@ module fdiv #(
     wire [24:0] sub_dropped = (sub_rsh <= 10'sd25)
                             ? (quo & ((25'd1 << sub_rsh[4:0]) - 25'd1))
                             : 25'd0;
-    wire sub_guard  = (sub_rsh >= 10'sd1) ? sub_dropped[sub_rsh[4:0] - 5'd1] : 1'b0;
-    wire sub_round  = (sub_rsh >= 10'sd2) ? sub_dropped[sub_rsh[4:0] - 5'd2] : 1'b0;
-    wire sub_sticky_drop = (sub_rsh >= 10'sd3)
-                          ? (|(sub_dropped & ((25'd1 << (sub_rsh[4:0] - 5'd2)) - 25'd1)))
+
+    wire       sub_in_window = (sub_rsh <= 10'sd25);
+    wire [4:0] sub_sh        = sub_in_window ? sub_rsh[4:0] : 5'd0;
+    wire sub_guard  = (sub_in_window && (sub_rsh >= 10'sd1)) ? sub_dropped[sub_sh - 5'd1] : 1'b0;
+    wire sub_round  = (sub_in_window && (sub_rsh >= 10'sd2)) ? sub_dropped[sub_sh - 5'd2] : 1'b0;
+    wire sub_sticky_drop = (sub_in_window && (sub_rsh >= 10'sd3))
+                          ? (|(sub_dropped & ((25'd1 << (sub_sh - 5'd2)) - 5'd1)))
                           : 1'b0;
-    wire sub_sticky = sub_sticky_drop | sub_sticky_all;
+    wire sub_sticky = sub_sticky_below | div_sticky;
 
     wire sub_round_up, sub_inexact;
     frm u_sub_frm (
@@ -258,9 +268,7 @@ module fdiv #(
         sub_fflags = 5'd0;
         if (sub_inexact) begin
             sub_fflags[`NX] = 1'b1;
-            // RISC-V tininess detected after rounding:
-            // exp_norm 为"指数无界"(正规路径)舍入后的指数，tiny 当且仅当仍 < -126
-            if (exp_norm < -10'sd126)
+            if (exp_norm < -10'sd126 && !sub_to_normal)
                 sub_fflags[`UF] = 1'b1;
         end
     end
@@ -308,12 +316,11 @@ module fdiv #(
             wb_id_r    <= {ID_WIDTH{1'b0}};
             wb_result_r<= 32'd0;
             wb_fflags_r<= 5'd0;
-        end else begin
+        end else if (flush) begin
+            busy       <= 1'b0;
+            cnt        <= 5'd0;
             wb_valid_r <= 1'b0;
-            if (flush) begin
-                busy <= 1'b0;
-                cnt  <= 5'd0;
-            end else if (fstart) begin
+        end else if (fstart) begin
                 busy        <= 1'b1;
                 cnt         <= 5'd0;
                 rem_ff      <= a_shifted_in - {1'b0, s2_sig};
@@ -335,8 +342,11 @@ module fdiv #(
                 id_ff       <= issue_id;
             end else if (busy) begin
                 if (wb_valid_r) begin
-                    // wb 已呈现一拍, 释放 busy, 允许下一条 fdiv
-                    busy <= 1'b0;
+                    // 写回保持到仲裁器取走为止
+                    if (wb_ack) begin
+                        wb_valid_r <= 1'b0;
+                        busy       <= 1'b0;
+                    end
                 end else if (cnt == 5'd12) begin
                     // 12 步 radix-4 迭代结束, 修正余数符号后组合结果写入 wb
                     wb_valid_r  <= 1'b1;
@@ -349,12 +359,13 @@ module fdiv #(
                     quo_ff <= quo_next;
                 end
             end
-        end
     end
 
     assign wb_valid   = wb_valid_r;
     assign wb_id      = wb_id_r;
     assign wb_result  = wb_result_r;
     assign wb_fflags  = wb_fflags_r;
+
+    assign busy_o     = busy;
 
 endmodule

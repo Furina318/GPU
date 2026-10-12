@@ -21,6 +21,14 @@ module fsqrt #(
     input  wire                flush      ,
     input  wire [ID_WIDTH-1:0] flush_id   ,
 
+    // 单槽单元的反压: busy 期间 fstart 会被 ~busy 抑制，
+    // 调用方必须据此拒发，否则请求被静默丢弃
+    output wire                busy_o     ,
+
+    // 写回握手: 仲裁器每拍只放行一个写回, 取走本单元结果的那一拍拉高 wb_ack。
+    // 未获授权时 wb_valid 必须保持, 否则结果会被永久丢弃
+    input  wire                wb_ack     ,
+
     output wire                wb_valid   ,
     output wire [ID_WIDTH-1:0] wb_id      ,
     output wire [        31:0] wb_result  ,
@@ -196,12 +204,12 @@ module fsqrt #(
             wb_id_r     <= {ID_WIDTH{1'b0}};
             wb_result_r <= 32'd0;
             wb_fflags_r <= 5'd0;
-        end else begin
+        end else if (flush) begin
+            // 被冲刷的结果直接丢弃
+            busy       <= 1'b0;
+            cnt        <= 5'd0;
             wb_valid_r <= 1'b0;
-            if (flush) begin
-                busy <= 1'b0;
-                cnt  <= 5'd0;
-            end else if (fstart) begin
+        end else if (fstart) begin
                 busy        <= 1'b1;
                 cnt         <= 5'd0;
                 P_ff        <= {1'b0, P0_in};
@@ -218,7 +226,11 @@ module fsqrt #(
                 id_ff       <= issue_id;
             end else if (busy) begin
                 if (wb_valid_r) begin
-                    busy <= 1'b0;
+                    // 写回保持到仲裁器取走为止
+                    if (wb_ack) begin
+                        wb_valid_r <= 1'b0;
+                        busy       <= 1'b0;
+                    end
                 end else if (cnt == 5'd12) begin
                     wb_valid_r  <= 1'b1;
                     wb_id_r     <= id_ff;
@@ -231,12 +243,13 @@ module fsqrt #(
                     W_ff  <= w_next;
                 end
             end
-        end
     end
 
     assign wb_valid   = wb_valid_r;
     assign wb_id      = wb_id_r;
     assign wb_result  = wb_result_r;
     assign wb_fflags  = wb_fflags_r;
+
+    assign busy_o     = busy;
 
 endmodule

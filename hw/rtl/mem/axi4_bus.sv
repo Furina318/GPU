@@ -1,7 +1,7 @@
 `ifndef AXI4_BUS_SV
 `define AXI4_BUS_SV
 
-`include "define.vh"
+`include "defines.vh"
 
 interface axi4_bus
 #(

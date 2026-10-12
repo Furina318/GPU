@@ -1,0 +1,37 @@
+# relu_swap.sg —— 共享内存 + 屏障 + 循环 + 谓词化访存(grammer.md §4.4/§6.4/§6.6/§6.8)
+#
+# 每个 lane 把自己那份载入共享槽, 同步之后去读**别人**的槽(可能跨 warp), 取绝对值, 再写回自己那份:
+#     out[off + idx] = |in[off + (31 - idx)]|      (idx 是 lane 号, 0..31)
+# 这里必须有一次 bar(): 读的是别的 warp 写进去的数据(§4.4 的 shared 语义)。
+# 第二处 bar() 保证下一轮循环覆盖共享内存之前, 所有 warp 都已读完本轮数据。
+
+const -: 0x02000000
+
+kernel relu_swap
+    var i, T, base, N, idx, off, addr, slot
+    var x : float
+    __shared__ tile : float[32] shared
+
+    param base : int @const[0]
+    param N    : int @const[4]
+
+    idx = tid() + wid() * 8
+    T   = ceildiv(N, 32)
+    i   = 0
+
+    while i < T:
+        off  = i * 32
+        addr = base + (off + idx) * 4
+        when idx < N - off : tile[idx] = ldx(addr)
+        bar()
+        slot = 31 - idx
+        x    = tile[slot]
+        when x < 0.0 : x = -x
+        addr = base + (off + idx) * 4
+        when idx < N - off : stx(addr, x)
+        bar()
+        i = i + 1
+    end
+
+    exit
+end

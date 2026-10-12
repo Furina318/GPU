@@ -2,3 +2,8 @@
 **/build/
 **/obj_dir/
 __pycache__/
+tb/.tools/
+tb/build/
+*.vcd
+dump.vcd
+results.xml

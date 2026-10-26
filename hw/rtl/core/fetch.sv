@@ -25,6 +25,7 @@ module fetch (
     input  wire  [`WARP_SIZE-1:0] target_taken   ,   // 谓词为真的 lane
 
     output wire                   imem_req_valid ,
+    input  wire                   imem_req_ready ,   // 取指口仲裁授予(请求被接受)
     output wire [31:0]            imem_req_pc    ,
     input  wire                   imem_rsp_valid ,
     input  wire [31:0]            imem_rsp_inst  ,
@@ -173,7 +174,8 @@ module fetch (
         else if (~halted) begin
             unique case (state)
                 S_IDLE: begin
-                    if (fet_in_valid & fet_in_ready & pc_ok)
+                    // 请求必须被取指口仲裁接受才算发出, 否则留在 S_IDLE(请求电平保持)
+                    if (fet_in_valid & fet_in_ready & pc_ok & imem_req_ready)
                         state <= S_RESP;         
                 end
 

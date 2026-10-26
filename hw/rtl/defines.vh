@@ -16,6 +16,7 @@
 `define SIMT_STACK_DEPTH 8
 `define SHARED_MEM_SIZE  16*1024
 `define INSTR_SRAM_SIZE  16*1024
+`define CLOG_INSTR       12      // 指令 SRAM 字数 4096 = 2^12
 
 // MEMORY
 `define CONST_BASE       32'h0200_0000

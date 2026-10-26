@@ -20,7 +20,7 @@ CP_DIR = RTL_DIR / "cp"
 #: 仿真专用胶水(不属于设计本体):tb/harness/rtl/fetch_imem_wrap.sv
 TB_RTL_DIR = Path(__file__).resolve().parent / "rtl"
 #: ``defines.vh`` 的所在目录 —— 每个 core/mem 模块都要 ``-I`` 它
-RTL_INCLUDES = (RTL_DIR, CORE_DIR, MEM_DIR, CP_DIR, TB_RTL_DIR)
+RTL_INCLUDES = (RTL_DIR, CORE_DIR, MEM_DIR, CP_DIR, FPU_DIR, TB_RTL_DIR)
 
 
 @dataclass(frozen=True)
@@ -134,7 +134,106 @@ DUTS: dict[str, Dut] = {
         include_dirs=RTL_INCLUDES,
         test_module="tests.core.test_instr_mem",
     ),
+    "lsu_coalescer": Dut(
+        name="lsu_coalescer",
+        toplevel="lsu_coalescer",
+        sources=(CORE_DIR / "lsu_coalescer.sv",),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_lsu_coalescer",
+    ),
+    "global_mem": Dut(
+        name="global_mem",
+        toplevel="global_mem_wrap",
+        sources=(MEM_DIR / "global_mem.sv", MEM_DIR / "wcb.sv",
+                 TB_RTL_DIR / "axi_ram_model.sv", TB_RTL_DIR / "global_mem_wrap.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_global_mem",
+    ),
+    "wcb": Dut(
+        name="wcb",
+        toplevel="wcb",
+        sources=(MEM_DIR / "wcb.sv",),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_wcb",
+    ),
+    "lsu": Dut(
+        name="lsu",
+        toplevel="lsu",
+        sources=(CORE_DIR / "lsu.sv", CORE_DIR / "lsu_coalescer.sv",
+                 MEM_DIR / "mem_map.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_lsu",
+    ),
+    "lsu_scheduler": Dut(
+        name="lsu_scheduler",
+        toplevel="lsu_scheduler",
+        sources=(CORE_DIR / "lsu_scheduler.sv",),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_lsu_scheduler",
+    ),
+    "mem_map": Dut(
+        name="mem_map",
+        toplevel="mem_map",
+        sources=(MEM_DIR / "mem_map.sv",),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_mem_map",
+    ),
+    "shared_mem": Dut(
+        name="shared_mem",
+        toplevel="shared_mem",
+        sources=(MEM_DIR / "shared_mem.sv",),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_shared_mem",
+    ),
     # -- command processor (SystemVerilog) ---------------------------------
+    "core": Dut(
+        name="core",
+        toplevel="core",
+        sources=(
+            CORE_DIR / "core_pkg.sv",
+            CORE_DIR / "alu.sv",
+            CORE_DIR / "mdu.sv",
+            CORE_DIR / "exu.sv",
+            CORE_DIR / "fetch.sv",
+            CORE_DIR / "simt_stack.sv",
+            CORE_DIR / "decode.sv",
+            CORE_DIR / "regfile.sv",
+            CORE_DIR / "wbu.sv",
+            CORE_DIR / "lsu.sv",
+            CORE_DIR / "lsu_coalescer.sv",
+            CORE_DIR / "lsu_scheduler.sv",
+            MEM_DIR / "mem_map.sv",
+            MEM_DIR / "shared_mem.sv",
+            MEM_DIR / "instr_mem.sv",
+            FPU_DIR / "fpu.v",
+            FPU_DIR / "fma_unit.v",
+            FPU_DIR / "fdiv.v",
+            FPU_DIR / "fsqrt.v",
+            FPU_DIR / "fcvt.v",
+            FPU_DIR / "fquick.v",
+            FPU_DIR / "fpu_arbiter.v",
+            FPU_DIR / "frm.v",
+            CORE_DIR / "core.sv",
+        ),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_core",
+    ),
+    "axi_arb": Dut(
+        name="axi_arb",
+        toplevel="axi_arb_wrap",
+        sources=(MEM_DIR / "axi_arb.sv", TB_RTL_DIR / "axi_ram_model.sv",
+                 TB_RTL_DIR / "axi_arb_wrap.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_axi_arb",
+    ),
+    "cp_adapter": Dut(
+        name="cp_adapter",
+        toplevel="cp_adapter_wrap",
+        sources=(MEM_DIR / "cp_mem_adapter.sv", TB_RTL_DIR / "axi_ram_model.sv",
+                 TB_RTL_DIR / "cp_adapter_wrap.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_cp_adapter",
+    ),
     "cp": Dut(
         name="cp",
         toplevel="cp",

@@ -51,10 +51,15 @@ make test                 # 文档一致性 + ISA 参考检查 + 栈模型 + 正
 # 3) 自定义着色语言
 make sg                   # sw/sg/*.sg → build/sg/*.bin
 
-# 4) RTL 仿真(cocotb + Verilator)
+# 4) RTL 单元/子系统测试(cocotb + Verilator)
 cd tb && make setup       # 一次性:安装固定版本 Verilator 到 tb/.tools
-make test                 # 跑全部 DUT;make list 看注册表
+make test                 # 跑全部 22 个 DUT 配置 / 118 个用例
 make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
+
+# 5) RTL 全系统仿真:整颗 GPU(CP + 2×SM + 内存子系统 + DDR)跑真实内核
+cd sim/run-sim && make    # 编译(约 8 分钟,只在 RTL 变了才需要重来)
+make check                # 跑 clear / gouraud / matmul / anim 并与参考模型逐位对拍
+make demo                 # anim 动画: SDL 窗口逐帧重算并显示(关窗或 ESC 结束)
 ```
 
 ## 3. 目录结构
@@ -62,13 +67,14 @@ make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
 | 路径 | 内容 |
 |---|---|
 | `docs/` | 四份权威手册:ISA / CMDS / GFX / SPEC;`HISTORY.md` 是设计决策与历史存档 |
-| `hw/rtl/core/` | `fetch.sv`、`simt_stack.sv` 及 SM 侧 RTL;`MEM_LSU.md` 是存储子系统的开发说明 |
+| `hw/rtl/core/` | SM 侧 RTL:取指、译码、执行、写回、访存(LSU)与 `core.sv` 顶层 |
 | `hw/rtl/cp/` | CP:命令译码、寄存器、AXI4-Lite 从口、CRC、21 态 FSM;`cp.md` 是设计说明 |
-| `hw/rtl/mem/` | 指令 SRAM、AXI 仲裁等内存子系统组件 |
+| `hw/rtl/mem/` | 指令/共享 SRAM、行读写 + 写合并、区域解码、AXI 仲裁、CP 访存适配、性能计数 |
 | `hw/rtl/fpu/` | FPU(译码、FMA、除法、格式转换、仲裁) |
 | `sim/simulator/` | C++ 全系统模拟器:参考模型(`src/`、`shader/`、`2D-engine/`)、内核校验、demo、调试器 |
+| `sim/run-sim/` | RTL 全系统仿真:Verilator 测试台把 CP + 2×SM + 内存子系统连起来跑 `sw/kernels/*.S` |
 | `sw/` | 汇编器 `assembly.py`、sg 语言编译器 `compiler.py`、内核 `kernels/*.S`、demo `demo/`、语言手册 `grammer.md` |
-| `tb/` | cocotb 测试平台:12 个 DUT 配置、74 个用例;`README.md` 是测试指南 |
+| `tb/` | cocotb 测试平台:22 个 DUT 配置、118 个用例;`README.md` 是测试指南 |
 
 ## 4. 文档地图
 
@@ -78,7 +84,8 @@ make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
 | 写 host 驱动 / 管理 CP | [`docs/CMDS.md`](docs/CMDS.md)(§2 队列、§3 命令表、§6 命令格式、§7 MMIO、§8 错误码、§10 同步) |
 | 用 2D 引擎画图 | [`docs/GFX.md`](docs/GFX.md)(§2 格式、§3 寄存器、§4 命令编码、§5 光栅化、§6 混合) |
 | 用 sg 语言写内核 | [`sw/grammer.md`](sw/grammer.md) |
-| 实现/修改 RTL | [`docs/SPEC.md`](docs/SPEC.md)(§2 地址归属、§3 信号级接口)、[`hw/rtl/cp/cp.md`](hw/rtl/cp/cp.md)、[`hw/rtl/core/MEM_LSU.md`](hw/rtl/core/MEM_LSU.md)、[`tb/README.md`](tb/README.md) |
+| 实现/修改 RTL | [`docs/SPEC.md`](docs/SPEC.md)(§2 地址归属、§3 信号级接口)、[`hw/rtl/cp/cp.md`](hw/rtl/cp/cp.md)、[`hw/rtl/fpu/README.md`](hw/rtl/fpu/README.md)、[`tb/README.md`](tb/README.md) |
+| 让整颗 GPU 跑起一个内核 | [`sim/run-sim/README.md`](sim/run-sim/README.md)(系统拓扑、测试台参数、命令流契约) |
 | 查"为什么这么设计" | [`docs/HISTORY.md`](docs/HISTORY.md)(ADR、被否决的方案、跨文档冲突) |
 
 权威归属:地址空间与接口契约归 SPEC;命令编码与 MMIO 归 CMDS;指令语义归 ISA;2D 参数/寄存器/光栅化规则归 GFX。同一事实只在一处定义,其余引用(见 [SPEC §5](docs/SPEC.md#5-与其它文档的关系权威归属))。
@@ -87,8 +94,11 @@ make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
 
 **已实现并验证**
 
-- ISA:四个内核全部跑通(clear / gouraud / matmul / abs);RTL 侧 `fetch` / `simt_stack` / `instr_mem` / FPU(5 个 DUT)都有 cocotb 覆盖;C++ 参考模型 `make test` 全绿(95 项)。
+- 指令集与着色器核:`fetch` / `simt_stack` / `instr_mem` / `decode` / `exu` / `lsu` / `core` 全部实现并有 cocotb 覆盖;四个内核在参考模型上全部跑通(clear / gouraud / matmul / abs)。
+- RTL 全系统:`sim/run-sim/` 里 CP + 2×SM + 内存子系统 + DDR 连起来,`clear` / `gouraud` / `matmul` 三个内核与参考模型**逐位一致**(2166 / 7720 / 173438 拍)。
+- FPU:5 个 DUT、30 个用例,Finite/NaN/Subnormal/五种舍入模式全覆盖;C++ 参考模型 `make test` 全绿(95 项)。
 - CP:全部命令、MMIO 寄存器、错误码与复位语义实现;15 个 cocotb 用例覆盖正例与错误路径,`--werror` 零 lint 警告。
+- 内存子系统:共享内存(bank 并行 + 冲突计费)、合并器、写合并缓冲、行读写、区域解码、3 主 AXI 仲裁、性能计数器都有独立用例。
 - 2D 引擎:填充 / 位块传送 / 三角形光栅化 / 混合,与 Python 参考模型逐像素对拍;`car` demo 两种画法逐位可比。
 
 **已知限制**(详细后果见 [ISA §10](docs/ISA.md#10-已知限制与扩展路线))
@@ -101,6 +111,6 @@ make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
 ## 6. 约定
 
 - 文档与实现必须同时改;改动摘要追加到各文档的"变更记录"表,编号唯一递增(`docs/HISTORY.md` 只存档过程,不是权威)。
-- 设计文档放在对应 RTL 旁边(`hw/rtl/cp/cp.md`、`hw/rtl/core/MEM_LSU.md`、`hw/rtl/fpu/README.md`),`docs/` 下只放四份权威手册与历史存档。
+- 设计文档放在对应 RTL 旁边(`hw/rtl/cp/cp.md`、`hw/rtl/fpu/README.md`、`hw/rtl/cache/README.md`),`docs/` 下只放四份权威手册与历史存档。
 - 每条规则引到具体章节(`§N.M`),交叉引用只指向存在的编号;`sim/simulator/tests/doc_consistency_check.py` 会机械校验这些约束,`make test` 的通过与否以它为准。
 - 仓库面向教学:规模化数字(周期数、吞吐)都是设计目标或实测估算,不是签核数据。

@@ -12,6 +12,10 @@
 驱动直接链接模拟器静态库 `sim/simulator/build/libsimu.a`,用与真实驱动相同的命令路径
 (`LOAD_KERNEL` → 逐帧 `PARAMS/LAUNCH/WAIT` → 读回帧缓冲)
 
+> 同一套 `anim.S` 也能在**真实 RTL** 上逐帧跑:`cd sim/run-sim && make demo`
+> (SDL 窗口,32×32 画布)或 `make anim`(不开窗口,逐帧与参考模型对拍)。
+> 参考模型一帧是毫秒级,RTL 仿真一帧要一秒左右 —— 差别在仿真速度,不在语义。
+
 ## demo.hpp: 公共框架
 
 框架负责所有 demo 相同的部分:**选项解析、镜像加载(`LOAD_KERNEL`)、逐帧

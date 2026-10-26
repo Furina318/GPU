@@ -80,6 +80,7 @@ module fetch_imem_wrap #(
         .target_taken   (target_taken   ),
         .imem_req_valid (imem_on        ),
         .imem_req_pc    (imem_pc        ),
+        .imem_req_ready (1'b1           ),
         .imem_rsp_valid (imem_rsp_valid ),
         .imem_rsp_inst  (imem_inst      ),
         .br_pending     (br_pending     ),

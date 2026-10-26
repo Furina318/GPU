@@ -38,7 +38,8 @@ BASE_SEED = int(os.environ.get("TB_SEED", "0"))
 FULL_MASK = M.FULL_MASK
 OP_CTRL = M.OP_CTRL
 IDLE_INPUTS = (("fet_in_valid", 0), ("fet_out_ready", 1), ("halt", 0),
-               ("launch", 0), ("launch_warp", FULL_MASK), ("imem_rsp_valid", 0), ("target_valid", 0))
+               ("launch", 0), ("launch_warp", FULL_MASK), ("imem_rsp_valid", 0),
+               ("imem_req_ready", 1), ("target_valid", 0))
 
 
 # --------------------------------------------------------------------------

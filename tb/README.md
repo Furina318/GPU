@@ -140,7 +140,11 @@ tb/
 │   ├── test_fpu_arbiter.py
 │   └── test_fpu_top.py
 ├── harness/rtl/            # simulation-only glue (not part of the design)
-│   └── fetch_imem_wrap.sv  # fetch + the real instr_mem, for one cocotb DUT
+│   ├── fetch_imem_wrap.sv  # fetch + the real instr_mem, for one cocotb DUT
+│   ├── axi_ram_model.sv    # AXI4 slave RAM (also used by sim/run-sim)
+│   ├── global_mem_wrap.sv  # global_mem + the AXI RAM model
+│   ├── axi_arb_wrap.sv     # axi_arb + the AXI RAM model
+│   └── cp_adapter_wrap.sv  # cp_mem_adapter + the AXI RAM model
 ├── tests/cp/               # command processor + CRC32
 │   ├── cp_env.py           # memory model, AXI4-Lite host, SM/engine/SRAM mocks
 │   ├── test_cp.py
@@ -152,7 +156,17 @@ tb/
 │   ├── test_simt_stack_ovf.py
 │   ├── test_fetch.py
 │   ├── test_fetch_imem.py  # nested7.S + random kernels on the real instr SRAM
-│   └── test_instr_mem.py   # preload port, 1-cycle read, overflow, image layout
+│   ├── test_instr_mem.py   # preload port, 1-cycle read, overflow, image layout
+│   ├── test_shared_mem.py  # 8 banks, broadcast, conflict billing, errors
+│   ├── test_lsu_coalescer.py # 8 lanes -> N 32B line requests
+│   ├── test_mem_map.py     # address-space decode + MMIO / hole errors
+│   ├── test_wcb.py         # write-combine buffer: merge, bypass, flush
+│   ├── test_global_mem.py  # line read/store through the real AXI path
+│   ├── test_lsu.py         # per-warp LSU: shared + coalesced global
+│   ├── test_lsu_scheduler.py # per-SM arbitration between the 4 warps
+│   ├── test_cp_adapter.py  # CP line/word access -> AXI4 master
+│   ├── test_axi_arb.py     # 3 masters -> 1 AXI4 port
+│   └── test_core.py        # end-to-end kernels on the SM top
 ├── build/                  # generated, gitignored
 └── .tools/                 # generated, gitignored
 ```
@@ -208,10 +222,11 @@ model follows RISC-V (every NaN-producing arithmetic op returns the canonical
 
 ## 5. What is covered
 
-74 tests over 12 DUT configurations: 30 on the FPU (all green on **both**
+118 tests over 22 DUT configurations: 30 on the FPU (all green on **both**
 simulators, stable across `TB_SEED=0..11` -- a 12-seed sweep is a good regression
-to run after any RTL change) plus 44 on the shader core front end, instruction
-memory and the command processor (Verilator only, see below):
+to run after any RTL change) plus 87 on the shader core front end, the memory
+subsystem, the LSU, the SM top level and the command processor (Verilator only,
+see below):
 
 | DUT | tests | coverage |
 |---|---|---|
@@ -242,6 +257,16 @@ because findings A and B were protocol bugs:
 | `fetch` | 12 | sequential PC, `ready` back-pressure, `nested7.S` PC/mask/depth sequence against two independent models, the `ERR_NO_RECOV` kernel (patched image, same trick as `run_tests.py`), `BAR_DIVERGENT` state visibility, illegal PC (`err_imem` + `FAULT_PC` + halt), **17 generated nested if/else kernels** (~580 instructions) diffed against the model (one forced `ERR_NO_RECOV`), the **three EXU handshake styles** the header allows (answer after `br_pending` / same-cycle combinational / level held until the `br_resolved` ack), a sticky external `halt`, a run with random `ready` back-pressure plus a 2-3 cycle instruction-SRAM latency, and the four uniform-branch encodings (`@!p0` resolved in the front end, predicate-all-false / all-true answered by the EXU) |
 | `instr_mem` | 4 | preload port (CP `LOAD_KERNEL`) + `load_done` pulse, exactly 1-cycle read latency, out-of-range write (`err_ovf` sticky, SRAM untouched), and the "image at offset 0, PC = entry_off" layout against a real assembled image |
 | `fetch_imem` | 2 | `nested7.S` + 4 generated kernels running against the **real** instruction SRAM (the testbench plays `LOAD_KERNEL`), with every fetched instruction word checked against the image |
+| `lsu_coalescer` | 2 | the four ISA §3.2 cases (consecutive / broadcast / masked / scattered), a store case checking per-word `req_wen`, and 300 random accesses diffed against an independent grouping model |
+| `shared_mem` | 6 | 8-lane conflict-free round-trip, broadcast (all lanes one address), same-bank conflict (`conflict_extra = max_b(distinct) - 1`), masked-lane exclusion, `BAD_ALIGN`/OOB (nothing executes), and 120 random warp accesses diffed against an independent array model |
+| `mem_map` | 2 | 16 boundary probes (MMIO / command queue / constant / image / semaphore / framebuffer / DDR / hole) plus 500 random addresses diffed against an independently written region table |
+| `wcb` | 3 | store-merge then read bypass, partial-line hits, merge into an AXI-returned line, capacity + flush handshake, and a 400-step random sequence against a dict model |
+| `global_mem` | 4 | whole-line read (8-beat burst) from a Verilog AXI RAM model, partial-lane store + flush + untouched lanes keep memory, WCB-all-hit read that must **not** issue an AXI read, and 12 lines (over the 8-entry WCB) under back-pressure |
+| `lsu` | 6 | shared load/store, cross-line global load (2 line requests in ascending line order), store word-index mapping, `BAD_ALIGN`, `MMIO_ACCESS` and `NO_MEM_REGION` |
+| `lsu_scheduler` | 4 | shared-port round-robin between two warps, store routed to the WCB (no read request), load response routed back to its owner, and the flush owner handshake |
+| `core` | 11 | end-to-end kernels on the SM top: 8-lane broadcast store, `ld.g`+add+`st.g` (line read + write merge), 4 warps using `tmov`/`wmov` to write `4*(tid+wid*8)`, 2 warps doing `st.s` → `bar.sync` → `ld.s` (shared memory + barrier flush), `divu`/`x/0`/`mul` through the MDU, `fmul`/`fadd`/`fma.f32` through the shared FPU, per-lane FP with lane-distinct inputs, an 8-lane **24B-stride** load spanning 6 lines, the **real** `sw/kernels/gouraud.S` (single warp, 8 vertices, affine result + colour pass-through checked bit-for-bit), a predicated write whose false lanes must not commit, and an 8-round `loop` guarded by `setp` on **p3** (regression for the one-hot `setp_pdst` truncation that turned p3 writes into p0) |
+| `cp_adapter` | 3 | CP line/word read through `cp_mem_adapter` (two 8-beat bursts for 64B, unaligned start still reads the whole line) and a word read + write round trip |
+| `axi_arb` | 4 | two masters reading concurrently (one burst at a time), CP priority, a full AW/W/B write burst, and back-to-back reads from the same master |
 
 The `fetch` testbench plays the *environment*, not the answer: a fake instruction
 SRAM (1-cycle `imem_req`/`imem_rsp`), a fake decoder that always accepts, and a
@@ -268,7 +293,7 @@ Note the convention it encodes: **a command that ends in an architectural error
 leaves the CP in ERROR on purpose**, so such a test waits for `CP_ERROR` instead of
 waiting for IDLE.
 
-These seven DUTs are **Verilator-only**: Icarus cannot elaborate them (it rejects
+These DUTs are **Verilator-only**: Icarus cannot elaborate them (it rejects
 member assignment into a packed-struct array, and `core/decode.sv` already uses
 the `inside` operator it lacks) -- see the note in `harness/duts.py`.  Lint the
 SV core instead; both new files are warning-clean under `-Wall`:
@@ -282,7 +307,8 @@ tb/.tools/pytools/verilator/bin/verilator --lint-only -Wall \
 `tb/harness/rtl/` holds **simulation-only glue** — currently just
 `fetch_imem_wrap.sv`, which connects `fetch` to `instr_mem` so that one cocotb
 DUT can elaborate both. It is not part of the design (the synthesizable wiring
-belongs in the SM top level, see `hw/rtl/core/MEM_LSU.md` §4.6).
+belongs in the SM top level, `hw/rtl/core/core.sv`, where `instr_mem` is also
+instantiated).
 
 Tests are written so that a mass of vectors produces a readable failure: the
 `Scoreboard` collects mismatches and reports "N of M checks failed" with the

@@ -8,10 +8,12 @@ module regfile (
     input  wire [`CLOG_GPR-1:0] gpr_wr_addr  ,
     input  wire                 gpr_wr_en    ,
     input  wire [ `NUM_GPR-1:0] gpr_wr_data  ,
-    output wire [`CLOG_GPR-1:0] gpr_rs1_addr ,
-    output wire [`CLOG_GPR-1:0] gpr_rs2_addr ,
+    input  wire [`CLOG_GPR-1:0] gpr_rs1_addr ,
+    input  wire [`CLOG_GPR-1:0] gpr_rs2_addr ,
+    input  wire [`CLOG_GPR-1:0] gpr_rs3_addr ,   // fma / imad 的第三个源
     output wire [ `NUM_GPR-1:0] gpr_rs1_data ,
     output wire [ `NUM_GPR-1:0] gpr_rs2_data ,
+    output wire [ `NUM_GPR-1:0] gpr_rs3_data ,
 
     input  wire [`CLOG_PRED-1:0] pred_wr_addr,
     input  wire                  pred_wr_en  ,
@@ -37,6 +39,7 @@ module regfile (
 
     assign gpr_rs1_data = (|gpr_rs1_addr) ? gpr[gpr_rs1_addr]  : `NUM_GPR'(0);
     assign gpr_rs2_data = (|gpr_rs2_addr) ? gpr[gpr_rs2_addr]  : `NUM_GPR'(0);
+    assign gpr_rs3_data = (|gpr_rs3_addr) ? gpr[gpr_rs3_addr]  : `NUM_GPR'(0);
     assign pred_rd_data = (|pred_rd_addr) ? pred[pred_rd_addr] : 1'b1;
 
 endmodule

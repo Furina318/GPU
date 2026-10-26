@@ -93,7 +93,10 @@ public:
 
     // ── MMIO 里属于 CP/引擎的寄存器(CMDS §7) ──
     uint32_t read_reg(uint32_t off);
-    void     write_reg(uint32_t off, uint32_t v);
+    // `from_cmd=true` ⇒ 这次写来自 `WRITE_REG` 命令的执行路径(时机/取值的错误已经在命令路径报过);
+    // 默认 `false` ⇒ host 直接写 MMIO。两条路径对 `CMD_QUEUE_BASE/SIZE` 的**时机**处理不同:
+    // 命令路径报 `ILLEGAL_STATE`,host 直写路径静默忽略(CMDS §2.1/§6.2,RTL 侧是 `cp_regs.sv` 的 `ext_wr_now` 门控)。
+    void     write_reg(uint32_t off, uint32_t v, bool from_cmd = false);
     void     reset();                          // CP_RESET(§7.3)
     void     on_sm_error(int smid);
     void     set_timeout_cycles(uint32_t c) { timeout_cycles_ = c ? c : 0x100000; }
@@ -101,6 +104,11 @@ public:
     uint32_t status() const;                   // CP_STATUS: bit0 IDLE, bit1 BUSY, bit2 ERROR
     bool     in_error() const { return err_ != CpErr::NO_ERROR || sm_fault_; }
     bool     idle() const { return !machine_.active() && !in_error(); }
+    // "CP IDLE 且队列为空" —— RTL 的 `idle_i`;CMDS §2.1 要求改 `CMD_QUEUE_BASE/SIZE` 必须满足它。
+    // 与 `status()` 的 bit0 是同一个判据(内核没在跑、没有待收尾的 LAUNCH、队列空、无错误)。
+    bool     idle_and_empty() const {
+        return !machine_.active() && !launch_pending_ && queue_empty() && !in_error();
+    }
     CpErr    error() const { return err_; }
     const std::string& error_detail() const { return err_detail_; }
     bool     sm_fault() const { return sm_fault_; }

@@ -162,7 +162,9 @@ public:
 
     // ── MMIO(CMDS.md §7) ──
     uint32_t mmio_read(uint32_t off);
-    void     mmio_write(uint32_t off, uint32_t v);
+    // `from_cmd=true` ⇒ 这次写来自命令流(`WRITE_REG` 的执行路径):错误的报告方式与 host 直写不同
+    // (见 `CommandProcessor::write_reg` 的注释与 CMDS §2.1/§6.2)。
+    void     mmio_write(uint32_t off, uint32_t v, bool from_cmd = false);
 
     // ── 访存(exec.cpp 用): 处理 MMIO 路由 + 已知内存区检查 ──
     bool load_word(int smid, uint32_t addr, uint32_t& out, SmErr* e);

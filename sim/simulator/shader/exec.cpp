@@ -537,7 +537,7 @@ uint32_t Machine::mmio_read(uint32_t off) {
     return 0;
 }
 
-void Machine::mmio_write(uint32_t off, uint32_t v) {
+void Machine::mmio_write(uint32_t off, uint32_t v, bool from_cmd) {
     switch (off) {
     case MMIO_SM0_ERROR:
     case MMIO_SM1_ERROR: {
@@ -571,7 +571,7 @@ void Machine::mmio_write(uint32_t off, uint32_t v) {
         return;
     default: break;
     }
-    if (cp_) { cp_->write_reg(off, v); return; }
+    if (cp_) { cp_->write_reg(off, v, from_cmd); return; }
     LogW("MMIO 写 0x%02x = 0x%x: 没有挂 CP, 忽略", off, v);
 }
 

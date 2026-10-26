@@ -1,6 +1,8 @@
 `ifndef DEFINES_VH
 `define DEFINES_VH
 
+`define RESET_PC 32'h0000_0000
+
 `define WARP_SIZE 8
 `define NUM_SM    2
 `define WARPS_PER_SM `WARP_SIZE/`NUM_SM
@@ -28,7 +30,7 @@
 
 // CMD -- CMD.md$3
 `define CMD_NOP         8'h00
-`define CMD_WAIT_REG    8'h01
+`define CMD_WRITE_REG   8'h01   // CMDS §3: 0x01 = WRITE_REG(原宏名 CMD_WAIT_REG 是笔误)
 `define CMD_READ_REG    8'h02
 `define CMD_LOAD_KERNEL 8'h03
 `define CMD_LAUNCH      8'h04
@@ -38,6 +40,13 @@
 `define CMD_IRQ         8'h08
 `define CMD_PARAMS      8'h09
 `define CMD_GEMM        8'h18
+
+// 2D 命令 -- GFX.md §4(CMDS §3: 0x10..0x17 归 2D)
+`define CMD_2D_FILL     8'h10
+`define CMD_2D_BLIT     8'h11
+`define CMD_2D_DRAW     8'h12
+`define CMD_2D_SET_REG  8'h13
+`define CMD_2D_FLUSH    8'h14
 
 // MMIO OFFSET-- CMD.md$7
 `define MMIO_CP_STATUS      8'h00

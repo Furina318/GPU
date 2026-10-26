@@ -4,6 +4,12 @@
 `include "defines.vh"
 
 package core_pkg;
+
+    typedef struct packed {
+        logic valid;
+        logic ready;
+    } handshake;
+
     typedef enum logic [7:0] {
         MDU_MUL    = 8'b0000_0001,
         MDU_MULH   = 8'b0000_0010,
@@ -64,7 +70,7 @@ package core_pkg;
 
     typedef struct packed {
         dec_fmt_t       fmt;
-        logic [31:0]    pc;             // 本指令 PC(ipdom/br 基址、trace)
+        logic [31:0]    pc;             
         logic [31:0]    raw;            // 原始 32 位指令
         // 谓词(U/R4 型无谓词字段, pred_used=0)
         logic           pred_used;

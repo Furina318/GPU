@@ -5,8 +5,8 @@
 
 interface axi4_bus
 #(
-  parameter int ADDR_W = 64,
-  parameter int DATA_W = 512,
+  parameter int ADDR_W = 32,
+  parameter int DATA_W = 32,
   parameter int ID_W   = 32
 );
 

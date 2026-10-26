@@ -1,10 +1,15 @@
 # SPEC.md —— SimpleGPU 系统规格与模块接口
 
-版本 0.3 · 关联文档:`ISA.md`(Shader 核)/ `CMDS.md`(命令集)/ `GFX.md`(2D 引擎)· 变更记录见 [附录 A](#附录-a变更记录)
+版本 0.5 · 关联文档:`ISA.md`(Shader 核)/ `CMDS.md`(命令集)/ `GFX.md`(2D 引擎)· 变更记录见 [附录 A](#附录-a变更记录)
 
-> **本文档回答什么**:这套 GPU 由哪几个模块组成、**模块之间的接口/握手是什么**、每个地址区间归谁、
-> 哪份文档对哪件事有最终解释权、以及现在还缺什么(待定项登记)。
-> 边界的最终仲裁见 §6 的"文档权威归属"表。
+> **读者指引**
+>
+> | 你要做的事 | 读 |
+> |---|---|
+> | 接总线 / 连模块(信号级) | §3 四个模块的端口表 + 契约(`hw/rtl/` 里的实现按它写) |
+> | 判断"这个地址/这件事归谁管" | §2 地址空间(唯一权威)+ §5 文档权威归属表 |
+> | 知道"哪部分还没做" | §7 待定项登记 |
+> | 跑起来看效果 | 仓库根 `README.md` 的"快速开始" |
 
 ---
 
@@ -80,7 +85,7 @@ SIMT 栈 8 深/warp(12B/帧,96B/warp)。
   (**已定义、未实现**,见 §7-1)。
 - **MMIO 基址定为 `0x0000_0000`**。
 - **命令长度定为变长 `length_words`,但驱动应把每条命令填充到 64B 边界**
-  (`CMDS.md` 附录 A 第 2 条:保留自描述的可扩展性)。
+  (`CMDS.md` §2.1:保留自描述的可扩展性)。
 - **内核访问 MMIO 窗口 = 架构错误 `MMIO_ACCESS`**(`CMDS.md` §8.2 第 6 项):MMIO 属 CP/host,
   放行等于允许内核误写 `CP_RESET`/`DOORBELL`。
 
@@ -95,27 +100,40 @@ SIMT 栈 8 深/warp(12B/帧,96B/warp)。
 
 | 方向 | 端口 | 宽度/组成 | 说明 |
 |---|---|---|---|
-| in | `mmio_req/rsp` | AXI4-Lite | host 写门铃/队列指针、读状态与错误 |
-| in/out | `dma_req/rsp` | AXI4 | 命令环读取、镜像加载、`READ_REG` 的落地写 |
-| out | `sm_launch[1:0]` | `{pc[32], num_warps[4], flags[4], valid}` | 分发 LAUNCH(放置规则见 `CMDS.md` §4.2) |
-| in | `sm_done[1:0]` / `sm_error[1:0]` / `sm_fault_pc[1:0]` | 1 / 4 / 32 | 完成与错误(ISA §2.5/§2.6) |
-| out | `sram_we[1:0]` | `{addr[14], data[32], we}` | `LOAD_KERNEL` 写指令 SRAM |
-| out | `engine_cmd` | `{engine[1:0], opcode[8], len[16], payload[]}` | 转交 GEMM/2D 命令 |
+| in/out | `mmio_req/rsp` | AXI4-Lite | host 写门铃/队列指针、读状态与错误。**CMDS §7 的寄存器只有一份实现,位于 CP 内部**(契约 5) |
+| in/out | `dma_req/rsp` | AXI4 | **全局内存**一侧:命令环读取、镜像加载、`READ_REG` 落地写、`PARAMS`/`SIGNAL`/信号量 |
+| out | `sm_launch[1:0]` | `{pc[32], num_warps[4], flags[4], valid}` | 分发 LAUNCH(放置规则见 `CMDS.md` §4.2);SM 顶层再翻译成每个 warp 的 `{launch, launch_pc, launch_warp}`(`launch_warp` = 启动时的 lane 掩码,典型全 1) |
+| in | `sm_done[1:0]` / `sm_error[1:0]` / `sm_fault_pc[1:0]` | 1 / 4 / 32 | 完成与错误(ISA §2.5/§2.6);这三个**归 SM 所有**,CP 只转发到 MMIO 读口(契约 6) |
+| out/in | `sram_load[1:0]` | `{load_en, load_addr[13], load_data[32], load_last}` / `{load_done, err_ovf}` | `LOAD_KERNEL` 写指令 SRAM;**端口以 `hw/rtl/mem/instr_mem.sv` 为准**:13 bit **字**地址、`load_last` 定序、下一拍 `load_done` 脉冲、越界 `err_ovf` 粘滞 |
+| out/in | `engine_cmd` / `engine_rsp` | `{valid, engine[1:0], opcode[7:0], len[15:0]}` + payload 流 `{wdata[32], wvalid, wlast}` / `{ready, status[2:0], error[7:0]}` | 转交 2D/GEMM 命令;`status` = `{ERROR, DONE, BUSY}`(CMDS §7/GFX §7.2),`error` = `2D_ERROR`/`GEMM_ERROR` 的码字 |
 | out | `irq` | 1 | `IRQ_STATUS & IRQ_ENABLE` |
 
 **契约**:
 1. `LOAD_KERNEL` 只在 CP `IDLE` 且队列为空时执行(镜像在取指脚下,不支持原地改)。
-2. LAUNCH 之后 CP 阻塞到"涉及的 SM 全部 `SM_DONE=1` 且 `SM_ERROR==0`"才处理下一条命令(`CMDS.md` §4.3)。
+2. LAUNCH 之后 CP 阻塞到"涉及的 SM 全部 `SM_DONE=1` 且 `SM_ERROR==0`"才处理下一条命令(`CMDS.md` §4.3);
+   `SM_DONE` 由 CP 在**分发时**清(warp 侧只读),否则第二个 kernel 会看到残留的 `SM_DONE=1` 而立刻"完成"。
 3. 依赖:`wait_id` 在分发前等 `SEM[id]`;`signal_id` 在完成后 `SEM[id] += 1`;超过 `TIMEOUT_CYCLES` ⇒ `TIMEOUT`。
 4. 任一 SM 出错 ⇒ `CP_ERROR = SM_FAULT`,不写信号量、不执行依赖它的命令(ISA §2.5)。
+5. **MMIO 访问模型(一份状态,两个访问口)**:CP 的状态机**直接读写自己的寄存器**(每拍可见,不经总线);
+   host 与其它单元经 `mmio_req/rsp` 访问**同一个**寄存器文件。**不允许影子副本** —— 一份状态两个副本
+   正是"host 改了 `CMD_TAIL` 而 CP 还在读旧值"这类 bug 的来源。
+6. **寄存器的拥有者**:`SM*_ERROR`/`SM*_FAULT_PC` 归 SM,`2D_*`/`GEMM_*` 归引擎,CP 只把它们转发到 MMIO 读口;
+   host 的"写任意值清零"由 CP 译码后**扇出到拥有者**(不是 CP 自己存一份可写的副本)。2D 引擎的寄存器空间
+   只能经 `2D_SET_REG` 命令写(GFX.md §3),不走 MMIO。
+7. **驱动写序**:同源 MMIO 写按发出顺序生效;驱动应等 `CMD_TAIL` 写的 `B` 响应之后再写 `DOORBELL`。
+
+> **两种访问路径别混**:命令环、内核镜像、常量区、信号量都在**全局内存**里 ⇒ 只能走 `dma_req/rsp`(主口),
+> 要用 64B 突发;而 CP 自己的寄存器(HEAD/TAIL/BASE/SIZE/ERROR/IRQ/配置)是**内部 flop**,既不进内存也不占
+> DMA 带宽。把"常用寄存器"做成内部寄存器、只留一条 MMIO 口给外部,正是本设计的选择(理由见 §3.1 契约 5)。
 
 ### 3.2 SM(着色器核,实例 ×2)
 
 | 方向 | 端口 | 宽度/组成 | 说明 |
 |---|---|---|---|
 | in | `launch` | `{pc[32], num_warps[4], flags[4]}` | 来自 CP;`flags` 已与镜像头交叉核对 |
-| out | `imem_req` | `{pc[32]}` | 每周期最多 1 次取指 |
-| in | `imem_rsp` | `{inst[32]}` | 指令 SRAM(预加载,无 icache) |
+| out | `imem_req` | `{pc[32], valid}` | 每周期最多 1 次取指;`valid` 限定"这一拍要读";SM 内部接 `mem/instr_mem.sv` 的取指口(取 `pc[13:2]` 当字地址) |
+| in | `imem_rsp` | `{inst[32], valid}` | 指令 SRAM(预加载,无 icache);`valid` 比 `req` 晚 1 拍 |
+| in | `imem_load` | 见 §3.1 的 `sram_load` | `LOAD_KERNEL` 的预加载口(来自 CP),端口定义以 `mem/instr_mem.sv` 为准 |
 | out | `dmem_req` | `{op[1], addr[32], wdata[32][8], mask[8]}` | 全局访存(8 lane 合并后的请求) |
 | in | `dmem_rsp` | `{rdata[32][8], err}` | 合并读回;`err` 含对齐/越界 |
 | out | `done` / `error[4]` / `fault_pc[32]` | 1 / 4 / 32 | `warp_alive == 0` 与错误码(CMDS §8.2) |
@@ -133,27 +151,33 @@ SIMT 栈 8 深/warp(12B/帧,96B/warp)。
 
 | 方向 | 端口 | 宽度/组成 | 说明 |
 |---|---|---|---|
-| in | `cmd` | 16 字内联描述符 | A/B/C 基址、M/N/K、stride、dtype、零点、重量化(`CMDS.md` §6.11) |
-| out | `dma_req/rsp` | AXI4 | 读 A/B、写 C |
-| out | `status` | `{busy, done, error[4]}` | MMIO `0x60`/`0x64` |
+| in | `engine_cmd` | 见 §3.1(命令头 + payload 流) | 16 字内联描述符:A/B/C 基址、M/N/K、stride、dtype、零点、重量化(`CMDS.md` §6.11) |
+| out | `dma_req/rsp` | AXI4 | 读 A/B、写 C(与 CP 的 DMA 一起进 §3.4 的仲裁) |
+| out | `status` / `error` | `{ERROR, DONE, BUSY}` / 码字 | 经 §3.1 的 `engine_rsp` 回 CP,再由 CP 暴露到 MMIO `0x60`/`0x64` |
 
 **契约**:v1 只实现 `dtype=0`(INT8 A/B → INT32 C),支持 `C_ACCUM`、`B_TRANSPOSED` 与零点;
 `REQUANT` 属 Phase 5,未实现时**报 `CMD_ERROR` 而不是静默忽略**。与 SM 之间**没有缓存一致性**,
-跨引擎可见性靠"完成 + `FENCE`"。
+跨引擎可见性靠"完成 + `FENCE`"。命令只经 `engine_cmd` 一条路进来(不再有并行的第二条描述符通路),
+"忙/完成/出错"只经 `engine_rsp` 一条路出去 —— 与 `2D_STATUS`/`2D_ERROR` 同约定。
 
 ### 3.4 内存子系统
 
 | 方向 | 端口 | 说明 |
 |---|---|---|
-| in | `mmio_req/rsp` | AXI4-Lite 从口(4KB 窗口,偏移见 `CMDS.md` §7) |
-| in | `master_req/rsp` | CP 的 DMA + 2 个 SM 的访存 + 各引擎,仲裁后走 AXI4 主口 |
+| in | `master_req/rsp`(多主) | CP 的 DMA + 2 个 SM 的访存 + 各引擎,仲裁后走 AXI4 主口 |
 | — | 写合并缓冲 | 每 SM 一个(约 4–8 项):`st.g` 先入缓冲、按地址合并;`exit` 与 `bar.sync` 负责冲刷 |
+| — | 共享内存 / 指令 SRAM | 每 SM 各 16KB,物理上 SM 私有(文件在 `hw/rtl/mem/`,由 SM 顶层实例化) |
 
-**契约**:MMIO 访问不经过写缓冲(必须立即生效);DDR/帧缓冲访问可合并;总线错误 ⇒ `BUS_ERROR`。
+**契约**:
+1. **MMIO 从口不在这里**:4KB 的 MMIO 窗口由 **CP** 拥有(`cp` 的 AXI4-Lite 从口 + 寄存器文件,§3.1);
+   内存子系统只负责 DDR/帧缓冲一侧的主口与写合并。
+2. MMIO 访问不经过写缓冲(必须立即生效);DDR/帧缓冲访问可合并;总线错误 ⇒ `BUS_ERROR`。
+3. 区域解码(MMIO 窗口 / 常量区 / 镜像区 / 信号量区 / 帧缓冲 / DDR)与"内核访问 MMIO = `MMIO_ACCESS` 错误"
+   的判定口径见 `CMDS.md` §7.2/§8.2。
 
 ### 3.5 2D 引擎与 host 接口
 
-2D 引擎的**参数、寄存器映射、顶点与帧缓冲格式全部由 `GFX.md` 定义**(v0.1 时它还不存在,现已落定)。
+2D 引擎的**参数、寄存器映射、顶点与帧缓冲格式全部由 `GFX.md` 定义**。
 本文档只固定接口形状与边界:
 
 - 命令 opcode `0x10–0x17`(`2D_FILL`/`2D_BLIT`/`2D_DRAW`/`0x15–0x17` 保留),
@@ -192,51 +216,48 @@ RTL 综合后要回来标定 `ISA.md` §8.1 的目标值。
 | 指令编码/语义、执行模型、分歧、SM 侧错误码 | **`ISA.md`** | CMDS 只引用 |
 | 命令编码、MMIO 寄存器、信号量、CP 错误码、镜像头 | **`CMDS.md`** | ISA 只引用 |
 | 系统组成、模块接口、地址归属、文档边界、待定项总表 | **`SPEC.md`**(本文档) | 计划 |
-| 2D 引擎(光栅/混合/纹理)与顶点/帧缓冲格式的最终定义 | **`GFX.md`**(v0.1 已落定) | ISA §7.2 的 `6×f32` 是它的一个用户,不是权威 |
+| 2D 引擎(光栅/混合/纹理)与顶点/帧缓冲格式的最终定义 | **`GFX.md`** | ISA §7.2 的 `6×f32` 是它的一个用户,不是权威 |
 
-> **同一件事只允许在一份文档里"定义"**:发现两处定义不一致时,以本表为准,并把冲突登记到 §7(待定项登记)。
-
----
-
-## 6. 开发流程约定(从本仓库的实践里提炼)
-
-1. **文档与实现必须同时改**:改编码/语义 ⇒ 同时改 `ISA.md`/`CMDS.md` 并写"变更记录"行(两份文档末尾各有一张表)。
-2. **引用了就必须存在**:文档里提到的文件/脚本/寄存器/错误码都要真的存在。
-3. **机器可查的结论优先**:能写成 `make test` 里的一条断言,就不要只写在文档里 ——
-   `tests/isa_ref_check.py`(文档表 ↔ 汇编器 ↔ 译码器 + 位域往返)、
-   `tests/stack_model_check.py`(ISA §2.3.3 的状态机独立实现)、
-   `tests/doc_consistency_check.py`(四份文档的引用/锚点/编号/交叉编码)、
-   `tests/run_tests.py`(错误路径 + 运行模式 + 2D 引擎逐像素对拍 + car demo + **sg 编译器**)就是这么来的。
-   工具链里新增的编译器 `sw/compiler.py`(`sw/grammer.md` 定义的自定义语言)同样按这条办事:
-   编译产物与**手写内核逐位对比**(clear 4096 像素、abs 32 字、relu_swap 64 字),`grammer.md`
-   错误码表里的 14 个码各有一个能触发的反例。
-4. **改动后重跑全绿**:`cd sim/simulator && make check && make test`。
-5. **数字要能复算**:性能与覆盖率的每个数字都要注明来源与前提(如 §4 的实测基线)。
+> **同一件事只允许在一份文档里"定义"**:两处定义不一致时以本表为准,并把冲突登记到 §7。
 
 ---
+
+## 6. 验证与工具链
+
+两条回归入口,全部可一条命令跑完:
+
+| 入口 | 覆盖内容 |
+|---|---|
+| `cd sim/simulator && make test` | 文档审计(`tests/doc_consistency_check.py`:章节引用、目录锚点、变更记录编号、跨文档编码一致)+ ISA 表↔汇编器↔译码器往返(`isa_ref_check.py`)+ SIMT 栈状态机的独立实现(`stack_model_check.py`)+ 功能回归(`tests/run_tests.py`:错误路径、运行模式、2D 引擎逐像素对拍、car demo、`sg` 编译器) |
+| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(12 个 DUT 配置);`--werror` 打开严格 lint |
+
+- **参考模型是独立的第二实现**:shader 核(`sim/simulator/shader/`)、2D 引擎(`2D-engine/gfx2d.cpp` + `tests/gfx2d_ref.py`)、CP(`src/cp.cpp`)。RTL 与模型逐位对齐,不允许"自证"。
+- **能机器检查的结论不写在文档里**:凡是能被 `make test` 的一条断言守住的东西,都写成断言(ISA 编码表、2D 命令长度、MMIO 偏移、错误码可达性)。
+- **文档与实现同时改**:改编码/语义必须在同一次提交里改对应文档并追加变更记录(`ISA.md` 附录 B、`CMDS.md` 附录 B、`GFX.md` 附录 B、本文档附录 A)。
 
 ## 7. 待定项登记(跨文档汇总)
 
-| # | 待定项 | 依赖 / 阻塞 | 当前默认值(不阻塞实现) |
+| # | 事项 | 现状 / 默认值 | 依赖 |
 |---|---|---|---|
-| 1 | 2D 引擎的**纹理路径**(`TEX_*` 寄存器、带 uv 的顶点格式)与索引/缩放/调色板三条保留命令 | v2(`GFX.md` §4.6/§9) | v1 已实现五条命令 + RGBA8888/RGB565;`TEX_*` 可写但引擎未使用;保留 opcode 报 `BAD_PARAM` |
-| 2 | **帧缓冲尺寸/格式**的寄存器 | — | **已关闭**(`GFX.md` §3):`FB_WIDTH/HEIGHT/STRIDE/FORMAT` 是 2D 引擎寄存器,经 `2D_SET_REG` 写;`FB_BASE` 仍在 `CMDS.md` §7 |
-| 3 | GEMM 的 `REQUANT`/FP16、`word13..15` 用途、引擎计数器 | --- | 未实现时报 `CMD_ERROR` |
-| 4 | 多 kernel 并发:参数块基址 + 指令 SRAM 槽位 | 需要 ISA 扩展 | 一次一个 kernel;常量区只能被一个内核占用 |
-| 5 | byte/half 访存与打包(纹理/量化前提) | `ISA.md` §10 路线第 5 项 | 只支持 32b 字对齐 |
-| 6 | ballot/vote(active mask → 寄存器) | `ISA.md` §10 路线第 1 项 | 用逐 lane 迭代与谓词绕开 |
-| 7 | 中断的消费方式(轮询 vs 物理中断线) | 平台(仿真/AXI-Lite) | `IRQ_STATUS`/`IRQ_ENABLE` 轮询 |
-| 8 | 命令环尾部的填充粒度 | 本文档决定 | 要求 `CMD_QUEUE_SIZE` 是 8 的倍数(否则尾部剩 4B 时没有合法 NOP 可填) |
-| 9 | 随机/故障注入回归的覆盖深度 | 工具投入 | 已覆盖 ISA §2.6 每类错误各一例 |
+| 1 | 2D 引擎的纹理路径(`TEX_*` 寄存器、带 uv 的顶点)与 `0x15–0x17` 三条保留命令 | v1 实现五条命令 + RGBA8888/RGB565,不含纹理;保留 opcode 报 `BAD_PARAM` | `GFX.md` v2 |
+| 2 | **帧缓冲尺寸/格式** | 已关闭:`FB_WIDTH/HEIGHT/STRIDE/FORMAT` 是 2D 引擎寄存器,经 `2D_SET_REG` 写(`GFX.md` §3);`FB_BASE` 在 `CMDS.md` §7 | — |
+| 3 | GEMM 的 `REQUANT`/FP16、`word13..15` 用途、引擎计数器 | 未实现时报 `CMD_ERROR` | 矩阵引擎实现 |
+| 4 | 多 kernel 并发:参数块基址 + 指令 SRAM 槽位 | 一次一个 kernel;常量区只能被一个内核占用 | ISA 扩展 |
+| 5 | byte/half 访存与打包(纹理/量化的前提) | 只支持 32b 字对齐 | `ISA.md` §10 |
+| 6 | ballot/vote(active mask → 寄存器) | 用逐 lane 迭代与谓词绕开 | `ISA.md` §10 |
+| 7 | 中断的消费方式(轮询 vs 物理中断线) | `IRQ_STATUS`/`IRQ_ENABLE` 轮询 | 平台 |
+| 8 | 命令环尾部的填充粒度 | 已关闭:`CMD_QUEUE_SIZE` 必须 **≥ 8 且为 8 的倍数**(尾部剩 4B 时没有合法 `NOP` 可填,`CMDS.md` §2.1) | — |
+| 9 | 随机/故障注入回归的覆盖深度 | ISA §2.6 每类错误各有一例 | 工具投入 |
 
 ---
 
 ## 附录 A:变更记录
 
-| # | 类别 | 变更 | 理由 |
-|---|---|---|---|
-| 1 | 决策 | 帧缓冲尺寸/格式列为待定项 §7-2,并写明当前默认(RGBA8888、尺寸走常量区参数) | 原文档只说"尺寸/格式由 GFX.md 描述",而 GFX.md 不存在 ⇒ 实现者无处可查 |
-| 2 | 跨文档·闭环(v0.3) | `GFX.md` v0.1 落定后回填本文档:§1 模块表(2D 引擎的规格出处改为 `GFX.md`,参考模型落点指向 GFX.md 的验证计划一节)、§2 的帧缓冲尺寸/格式改为"2D 引擎寄存器"、§3.5 重写为"接口形状 + GFX.md 出处"、§5 权威表去掉"未创建"、§7 第 1 条改写、**第 2 条关闭** | 上一版有 5 处写"依赖 GFX.md / GFX.md 未创建":一份**不存在**的文档不能作为权威,否则实现者只能猜顶点格式、寄存器偏移与命令长度。现在这些都能在 GFX.md 里查到 |
-| 3 | 一致性·修正(v0.3) | 修正指向不存在的章节的引用:待定项表是 **§7**,原文里指向"第 8 节"的三个引用改为 §7-1/§7-2/§7-5 | 编号漂移让读者去翻一个不存在的章节;交叉引用必须指向**当前存在**的编号。同一处错误在 `CMDS.md` 里也有(已一并修正,见其变更记录第 32 条) |
-| 4 | 实现·落地(v0.4) | 2D 引擎从占位变成可运行实现: 模块表补 `2D-engine/gfx2d.cpp` 与 `tests/gfx2d_ref.py`、SM 的参考模型路径改为 `shader/`(源码按模块分目录)、§3.5 与 §7-1 的"未实现"改为"已实现(纹理除外)" | 上一版把 2D 引擎登记为"无参考模型":命令流到 CP 就断了。现在它有实现、有独立参考模型、有逐像素对拍的用例,§7-1 也从"整块未实现"收窄成"v2 的纹理与三条保留命令" |
-| 5 | 工具链·编译器(v0.4) | 新增 `sw/compiler.py` + `sw/grammer.md`(自定义语言 `.sg` → ISA 汇编):§6 的每个语言构造按模板展开, 错误码表里的 14 个码全部实现;`sw/sg/` 里三个示例(clear / abs / relu_swap)与手写内核逐位等价, `make sg` 一键编译, `make test` 第 ⑬ 节守着 | 有了 ISA 与 2D 引擎之后,"写内核"成了日常操作, 而手写汇编的寄存器/标签/谓词管理重复且易错。编译器的价值不在于优化, 而在于**把"能被机器检查的约束"(寄存器上限、bar 均匀性、对齐、类型)在编译期钉住** —— 例如 `relu_swap.sg` 里"循环里带 bar.sync"之所以合法, 靠的是编译器算出了循环条件与 lane 无关 |
+| # | 版本 | 变更摘要 |
+|---|---|---|
+| 1 | v0.1 → v0.2 | 帧缓冲尺寸/格式登记为待定项并写明当时的默认(RGBA8888、尺寸走常量区参数) |
+| 2 | v0.3 | 与 `GFX.md` 闭环:§1 模块表补 2D 引擎的规格出处、§2 的帧缓冲几何改为"2D 引擎寄存器"、§3.5 按接口重写、§5 权威表定稿、§7-1/§7-2 改写与关闭;修正三处指向不存在章节的引用 |
+| 3 | v0.4 | 2D 引擎与 `sg` 编译器落地回填(§1、§3.5、§6);§3.2 的 SM 取指口补 `valid` 与 1 拍回读延迟;§3.1 按 RTL 重写预加载口与 `engine_cmd` 流,并补 MMIO 访问模型契约 5–7;§7 第 8 项关闭(命令环填充粒度定在 `CMDS.md` §2.1) |
+| 4 | v0.5(本次) | 手册化:§6 改为"验证与工具链"(原开发流程叙述移至 `docs/HISTORY.md` §5),§7 待定项改为现状表,附录压缩为版本摘要,头部加读者指引 |
+
+> 每条改动的理由与跨文档冲突的处置过程见 `docs/HISTORY.md`;逐条提交记录见 `git log`。

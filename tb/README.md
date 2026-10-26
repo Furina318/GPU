@@ -139,6 +139,20 @@ tb/
 │   ├── test_fcvt.py
 │   ├── test_fpu_arbiter.py
 │   └── test_fpu_top.py
+├── harness/rtl/            # simulation-only glue (not part of the design)
+│   └── fetch_imem_wrap.sv  # fetch + the real instr_mem, for one cocotb DUT
+├── tests/cp/               # command processor + CRC32
+│   ├── cp_env.py           # memory model, AXI4-Lite host, SM/engine/SRAM mocks
+│   ├── test_cp.py
+│   └── test_crc32.py
+├── tests/core/             # shader core front end + instruction memory
+│   ├── stack_model.py      # ISA §2.3.3 reference model + a mini datapath
+│   ├── dut_drivers.py      # shared event driver / state comparison helpers
+│   ├── test_simt_stack.py
+│   ├── test_simt_stack_ovf.py
+│   ├── test_fetch.py
+│   ├── test_fetch_imem.py  # nested7.S + random kernels on the real instr SRAM
+│   └── test_instr_mem.py   # preload port, 1-cycle read, overflow, image layout
 ├── build/                  # generated, gitignored
 └── .tools/                 # generated, gitignored
 ```
@@ -194,9 +208,10 @@ model follows RISC-V (every NaN-producing arithmetic op returns the canonical
 
 ## 5. What is covered
 
-29 tests over 5 DUT configurations. All green on **both** simulators, and stable
-across `TB_SEED=0..11` (a 12-seed sweep is a good regression to run after any RTL
-change):
+74 tests over 12 DUT configurations: 30 on the FPU (all green on **both**
+simulators, stable across `TB_SEED=0..11` -- a 12-seed sweep is a good regression
+to run after any RTL change) plus 44 on the shader core front end, instruction
+memory and the command processor (Verilator only, see below):
 
 | DUT | tests | coverage |
 |---|---|---|
@@ -217,6 +232,57 @@ because findings A and B were protocol bugs:
   accepted in 32 cycles, so the write-back hold logic did not cost throughput.
 * `test_mixed_burst_no_loss` — the exact op mix that used to lose 4 of 12
   results now loses none.
+
+### Shader core front end + instruction memory (`simt_stack`, `fetch`, `instr_mem`)
+
+| DUT | tests | coverage |
+|---|---|---|
+| `simt_stack` | 8 | §2.3.1 three cases, §2.3.3 path switch / pop / empty-path fast case, several pops inside one advance, a branch landing exactly on its convergence point, 7-deep nesting, `ERR_NO_RECOV`, an EXU sending an unmasked `taken`, and **3 000 random events compared cycle-by-cycle** (combinational outputs *and* registered state) against an independently written §2.3.3 model |
+| `simt_stack_ovf` (`DEPTH=2`) | 2 | `SIMT_OVF` on a deliberately tiny stack (ISA §2.6 notes it is unreachable at DEPTH=8), reset/launch clearing the stack and mask |
+| `fetch` | 12 | sequential PC, `ready` back-pressure, `nested7.S` PC/mask/depth sequence against two independent models, the `ERR_NO_RECOV` kernel (patched image, same trick as `run_tests.py`), `BAR_DIVERGENT` state visibility, illegal PC (`err_imem` + `FAULT_PC` + halt), **17 generated nested if/else kernels** (~580 instructions) diffed against the model (one forced `ERR_NO_RECOV`), the **three EXU handshake styles** the header allows (answer after `br_pending` / same-cycle combinational / level held until the `br_resolved` ack), a sticky external `halt`, a run with random `ready` back-pressure plus a 2-3 cycle instruction-SRAM latency, and the four uniform-branch encodings (`@!p0` resolved in the front end, predicate-all-false / all-true answered by the EXU) |
+| `instr_mem` | 4 | preload port (CP `LOAD_KERNEL`) + `load_done` pulse, exactly 1-cycle read latency, out-of-range write (`err_ovf` sticky, SRAM untouched), and the "image at offset 0, PC = entry_off" layout against a real assembled image |
+| `fetch_imem` | 2 | `nested7.S` + 4 generated kernels running against the **real** instruction SRAM (the testbench plays `LOAD_KERNEL`), with every fetched instruction word checked against the image |
+
+The `fetch` testbench plays the *environment*, not the answer: a fake instruction
+SRAM (1-cycle `imem_req`/`imem_rsp`), a fake decoder that always accepts, and a
+fake EXU that answers only what `fetch.sv` delegates -- the branch resolution of
+a `br.simt` whose predicate field is not `p0`.  Expectations come from
+`tests/core/stack_model.py` (a from-the-document re-implementation of §2.3.3,
+with a mini datapath) and, for `nested7.S`, additionally from
+`sim/simulator/tests/stack_model_check.py` -- the doc-derived model that already
+validates the C++ simulator.  So the RTL is pinned against two independent
+transcriptions of the same rules rather than against itself.
+
+### Command processor (`cp`)
+
+| DUT | tests | coverage |
+|---|---|---|
+| `cp` | 15 | CMDS §7 register file (reset values, RO, write-any-value-clears, `CP_STATUS`), NOP/variable-length walk + `IRQ_ON_DONE`, SIGNAL/WAIT/READ_REG/IRQ/FENCE/PARAMS, queue boundary errors (len<2, past `CMD_TAIL`, reserved opcode, reserved `cmd_flags`), `WAIT` timeout and real `wait_id` blocking, `LOAD_KERNEL` (header + CRC + both SMs' instruction SRAM + `SM_KERNEL_MASK`) followed by LAUNCH to `SM_DONE` (semaphore + `IRQ_LAUNCH_DONE`), CRC/flag mismatch, `LAUNCH_REJECT` / `STALE_SM_ERROR` ordering, SM fault without signalling, GEMM/2D payload dispatch, engine fault, `CP_RESET` semantics, `BUS_ERROR` on a queue read, and the queue-pointer register rules (§2.1/§6.2/§7: `CMD_QUEUE_SIZE` must be `>= 8` and a multiple of 8, `CMD_QUEUE_BASE` 4B-aligned outside the MMIO window, `CMD_HEAD` in-range and 4B-aligned and **host-only**; IDLE-only timing; the command path reports `CMD_ERROR`/`ILLEGAL_STATE` while a host MMIO write is silently ignored) -- including the check that a host write moving `head` back onto already-consumed commands makes the CP **re-read the queue from memory** instead of reusing its line buffer |
+| `crc32_word` | 1 | CRC-32/ISO-HDLC word-at-a-time against `zlib.crc32` (standard vector, a real kernel image, 20 random streams) -- this is what makes `LOAD_KERNEL`'s header check trustworthy |
+
+The `cp` testbench plays the environment (see `tests/cp/cp_env.py`): a sparse global
+memory that answers the CP's line/word memory protocol, an AXI4-Lite host driver,
+two SM mocks (kernel run time, injectable `sm_error`), 2D/GEMM engine mocks that
+drain the payload stream, and a model of the instruction-SRAM preload port.
+Note the convention it encodes: **a command that ends in an architectural error
+leaves the CP in ERROR on purpose**, so such a test waits for `CP_ERROR` instead of
+waiting for IDLE.
+
+These seven DUTs are **Verilator-only**: Icarus cannot elaborate them (it rejects
+member assignment into a packed-struct array, and `core/decode.sv` already uses
+the `inside` operator it lacks) -- see the note in `harness/duts.py`.  Lint the
+SV core instead; both new files are warning-clean under `-Wall`:
+
+```bash
+tb/.tools/pytools/verilator/bin/verilator --lint-only -Wall \
+    -Ihw/rtl -Ihw/rtl/core -Ihw/rtl/mem \
+    hw/rtl/core/simt_stack.sv hw/rtl/core/fetch.sv hw/rtl/mem/instr_mem.sv
+```
+
+`tb/harness/rtl/` holds **simulation-only glue** — currently just
+`fetch_imem_wrap.sv`, which connects `fetch` to `instr_mem` so that one cocotb
+DUT can elaborate both. It is not part of the design (the synthesizable wiring
+belongs in the SM top level, see `hw/rtl/core/MEM_LSU.md` §4.6).
 
 Tests are written so that a mass of vectors produces a readable failure: the
 `Scoreboard` collects mismatches and reports "N of M checks failed" with the

@@ -88,7 +88,7 @@ void CommandProcessor::sem_add(uint32_t id) {
 
 uint32_t CommandProcessor::status() const {
     uint32_t s = 0;
-    if (!machine_.active() && !launch_pending_ && queue_empty() && !in_error()) s |= 1u << 0;
+    if (idle_and_empty())                                                     s |= 1u << 0;
     if (machine_.active() || launch_pending_ || !queue_empty())               s |= 1u << 1;
     if (in_error())                                                          s |= 1u << 2;
     return s;
@@ -422,7 +422,7 @@ bool CommandProcessor::exec_cmd(CmdInfo& ci, const uint32_t* w) {
         char b[96];
         std::snprintf(b, sizeof(b), "WRITE_REG 0x%02x ← 0x%08x", addr, value);
         ci.summary = b;
-        machine_.mmio_write(addr, value);
+        machine_.mmio_write(addr, value, /*from_cmd=*/true);   // 时机已在上面查过 ⇒ 不再走 host 路径的门控
         return true;
     }
 
@@ -716,13 +716,16 @@ bool CommandProcessor::exec_gemm(const uint32_t* w, CmdInfo& ci) {
 // ─────────────────────────── MMIO 寄存器 ───────────────────────────
 
 bool CommandProcessor::writable_reg(uint32_t off) const {
+    // CMDS §7: `CMD_HEAD` **不在**这张表里 —— 它是 "R(host 写仅用于异常恢复)",命令流写它(`WRITE_REG`)⇒ `CMD_ERROR`。
+    // 它与 `CMD_TAIL` 的不对称是故意的:TAIL 是驱动的前进指针(允许在命令流里推进),HEAD 是 CP 的读取指针
+    // (让命令流改它等于让 CP 跳过/重读命令;"丢弃未处理命令"是 `CP_RESET` 的职责)。
     switch (off) {
     case MMIO_CP_ERROR: case MMIO_CMD_TAIL: case MMIO_DOORBELL: case MMIO_IRQ_STATUS:
     case MMIO_IRQ_ENABLE: case MMIO_SEM_BASE: case MMIO_CMD_QUEUE_BASE: case MMIO_CMD_QUEUE_SIZE:
     case MMIO_FB_BASE: case MMIO_CP_RESET: case MMIO_TIMEOUT_CYCLES: case MMIO_GEMM_ERROR:
     case MMIO_2D_ERROR:
-    // CMDS §7: SM*_ERROR 是 "R / 写任意值清零", CMD_HEAD 允许 host 写用于异常恢复(§7.3 的恢复流程要用)
-    case MMIO_SM0_ERROR: case MMIO_SM1_ERROR: case MMIO_CMD_HEAD:
+    // SM*_ERROR 是 "R / 写任意值清零"(CMDS §7)
+    case MMIO_SM0_ERROR: case MMIO_SM1_ERROR:
         return true;
     default:
         return false;
@@ -753,7 +756,15 @@ uint32_t CommandProcessor::read_reg(uint32_t off) {
     }
 }
 
-void CommandProcessor::write_reg(uint32_t off, uint32_t v) {
+void CommandProcessor::write_reg(uint32_t off, uint32_t v, bool from_cmd) {
+    // CMDS §2.1: `CMD_QUEUE_BASE/SIZE` 只允许在 CP IDLE 且队列为空时改。命令路径的时机错误已经在
+    // WRITE_REG 的执行里报成 ILLEGAL_STATE(见 exec_is_last_ 那段),这里只管 host 直写路径 ——
+    // 与 RTL 一致:静默忽略、寄存器保持原值(cp_regs.sv 的 `ext_wr_now` 门控)。
+    if (!from_cmd && (off == MMIO_CMD_QUEUE_BASE || off == MMIO_CMD_QUEUE_SIZE) && !idle_and_empty()) {
+        LogW("MMIO 0x%02x ← 0x%x 被忽略: 只允许在 CP IDLE 且队列为空时改 CMD_QUEUE_*(CMDS §2.1);"
+             "host 直写路径不报错,需要错误码请走 WRITE_REG 命令", off, v);
+        return;
+    }
     switch (off) {
     case MMIO_CP_ERROR:
         if (v) LogI("host 清除 CP_ERROR(原值 %s: %s)", cp_err_name(err_), err_detail_.c_str());
@@ -784,12 +795,20 @@ void CommandProcessor::write_reg(uint32_t off, uint32_t v) {
         head_ = tail_ = v;
         return;
     case MMIO_CMD_HEAD:
+        // CMDS §7: host 只用于异常恢复。取值必须落在队列内且 4B 对齐,越界/未对齐的写**被忽略**、
+        // 保持原值 —— 与 RTL 一致(`cp_regs.sv` 里"只接受队列范围内的值, 越界丢弃")。
+        // 越界写若"跳到 tail",等价于悄悄丢掉在途命令;那是 CP_RESET(§7.3)的职责,不是 CMD_HEAD 的。
+        if (v < queue_base_ || v >= queue_base_ + queue_size_ || (v & 3u)) {
+            LogW("CMD_HEAD ← 0x%08x 被忽略(必须落在 [0x%08x, 0x%08x) 且 4B 对齐), 保持 0x%08x",
+                 v, queue_base_, queue_base_ + queue_size_, head_);
+            return;
+        }
         LogI("CMD_HEAD ← 0x%08x(host 异常恢复, CMDS §7)", v);
-        head_ = v >= queue_base_ && v < queue_base_ + queue_size_ ? v : tail_;
+        head_ = v;
         return;
     case MMIO_CMD_QUEUE_SIZE:
-        // §2.1 要求是 4 的倍数, 但 §6.1 规定 NOP ≥ 2 字 ⇒ 回绕填充需要 8 的倍数;
-        // 0 会让 (head_ - tail_ + queue_size_) % queue_size_ 除零 ⇒ 必须挡住
+        // CMDS §2.1: 必须 ≥ 8 且为 8 的倍数 —— 4 的倍数会在回绕时空出 4 字节, 而 NOP 至少 2 字(§6.1)
+        // ⇒ 没有任何合法填法; 0 还会让 (head_ - tail_ + queue_size_) % queue_size_ 除零 ⇒ 必须挡住
         if (v < 8 || (v & 7u)) {
             LogW("CMD_QUEUE_SIZE ← %u 被拒绝: 必须是 ≥ 8 且为 8 的倍数(§2.1 + §6.1 的 NOP 填充), 保持 %u",
                  v, queue_size_);

@@ -3,10 +3,7 @@
 Add a :class:`Dut` entry per DUT (or per DUT *group*, when several modules must
 be elaborated together).  ``tb/run.py --list`` prints this table.
 
-Only modules that actually exist and elaborate are registered.  The project is
-still mid-build -- ``hw/rtl/core/{core,exu,fetch}.sv`` are empty and
-``hw/rtl/mem/axi_arb.sv`` is a stub -- so the FPU is the first complete,
-self-contained block available to verify.
+
 """
 
 from __future__ import annotations
@@ -17,6 +14,13 @@ from pathlib import Path
 from .env import RTL_DIR
 
 FPU_DIR = RTL_DIR / "fpu"
+CORE_DIR = RTL_DIR / "core"
+MEM_DIR = RTL_DIR / "mem"
+CP_DIR = RTL_DIR / "cp"
+#: 仿真专用胶水(不属于设计本体):tb/harness/rtl/fetch_imem_wrap.sv
+TB_RTL_DIR = Path(__file__).resolve().parent / "rtl"
+#: ``defines.vh`` 的所在目录 —— 每个 core/mem 模块都要 ``-I`` 它
+RTL_INCLUDES = (RTL_DIR, CORE_DIR, MEM_DIR, CP_DIR, TB_RTL_DIR)
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,73 @@ DUTS: dict[str, Dut] = {
         include_dirs=(FPU_DIR,),
         parameters={"NUM_PORTS": 5, "ID_WIDTH": 5, "DATA_WIDTH": 32},
         test_module="tests.fpu.test_fpu_arbiter",
+    ),
+    # -- shader core front end (SystemVerilog) ------------------------------
+    # NOTE: the `core`/`mem` DUTs are Verilator-only.  Icarus Verilog's
+    # SystemVerilog support is a subset and cannot elaborate them (it rejects
+    # member assignment into a packed-struct array, and it does not implement
+    # the `inside` operator that `core/decode.sv` uses), so `--sim icarus`
+    # covers the FPU only.  Lint them with, e.g.:
+    #   tb/.tools/pytools/verilator/bin/verilator --lint-only -Wall \
+    #       -Ihw/rtl -Ihw/rtl/core hw/rtl/core/simt_stack.sv hw/rtl/core/fetch.sv
+    "simt_stack": Dut(
+        name="simt_stack",
+        toplevel="simt_stack",
+        sources=(CORE_DIR / "simt_stack.sv",),
+        include_dirs=RTL_INCLUDES,
+        parameters={"DEPTH": 8, "LANES": 8},
+        test_module="tests.core.test_simt_stack",
+    ),
+    #: SIMT_OVF (ISA §2.6) is unreachable with an 8-deep stack, so the overflow
+    #: path is exercised on a deliberately tiny instance instead.
+    "simt_stack_ovf": Dut(
+        name="simt_stack_ovf",
+        toplevel="simt_stack",
+        sources=(CORE_DIR / "simt_stack.sv",),
+        include_dirs=RTL_INCLUDES,
+        parameters={"DEPTH": 2, "LANES": 8},
+        test_module="tests.core.test_simt_stack_ovf",
+    ),
+    "fetch": Dut(
+        name="fetch",
+        toplevel="fetch",
+        sources=(CORE_DIR / "simt_stack.sv", CORE_DIR / "fetch.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_fetch",
+    ),
+    # -- memory ------------------------------------------------------------
+    "instr_mem": Dut(
+        name="instr_mem",
+        toplevel="instr_mem",
+        sources=(MEM_DIR / "instr_mem.sv",),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_instr_mem",
+    ),
+    # -- command processor (SystemVerilog) ---------------------------------
+    "cp": Dut(
+        name="cp",
+        toplevel="cp",
+        sources=(CP_DIR / "cp_pkg.sv", CP_DIR / "axil_slave.sv", CP_DIR / "cp_regs.sv",
+                 CP_DIR / "cmd_decode.sv", CP_DIR / "crc32_word.sv", CP_DIR / "cp.sv"),
+        include_dirs=RTL_INCLUDES + (CP_DIR,),
+        test_module="tests.cp.test_cp",
+    ),
+    "crc32_word": Dut(
+        name="crc32_word",
+        toplevel="crc32_word",
+        sources=(CP_DIR / "crc32_word.sv",),
+        include_dirs=RTL_INCLUDES + (CP_DIR,),
+        test_module="tests.cp.test_crc32",
+    ),
+    #: `fetch` against the **real** instruction SRAM instead of the testbench's
+    #: fake imem; the wrapper is simulation-only glue (see tests/core/fetch_env).
+    "fetch_imem": Dut(
+        name="fetch_imem",
+        toplevel="fetch_imem_wrap",
+        sources=(CORE_DIR / "simt_stack.sv", CORE_DIR / "fetch.sv",
+                 MEM_DIR / "instr_mem.sv", TB_RTL_DIR / "fetch_imem_wrap.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.core.test_fetch_imem",
     ),
 }
 

@@ -3,12 +3,10 @@
 module decode (
     input  logic                clk        ,   
     input  logic                rst        ,
-    input  logic                in_valid   ,
-    output logic                in_ready   ,
+    input  core_pkg::handshake  dec_in     ,
+    output core_pkg::handshake  dec_out    ,
     input  logic [31:0]         in_pc      ,
     input  logic [31:0]         in_inst    ,
-    output logic                out_valid  ,
-    input  logic                out_ready  ,
     output core_pkg::dec_info_t dec_info
 );
     import core_pkg::*;
@@ -281,15 +279,15 @@ module decode (
 
     dec_info_t dec_q;
     assign dec_info = dec_q;
-    assign in_ready = out_ready;
+    assign dec_out.ready = dec_in.ready;
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            out_valid <= 1'b0;
+            dec_out.valid <= 1'b0;
             dec_q     <= '0;
-        end else if (in_ready) begin
-            out_valid <= in_valid;
-            if (in_valid)
+        end else if (dec_out.ready) begin
+            dec_out.valid <= dec_in.valid;
+            if (dec_in.valid)
                 dec_q <= dec_next;
         end
     end

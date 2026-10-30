@@ -1,5 +1,9 @@
 `include "fpu_config.vh"
 // 一周期计算单元
+/* verilator lint_off UNUSEDSIGNAL */
+// 浮点数据通路按算法保留满位宽(尾数 + 保护位 + 粘滞位 + 进位链余量),
+// 其中若干输入/中间位只在特定的舍入或异常路径上参与判决 —— 这些
+// "未使用"是刻意留的位宽, 删掉会改变进位链与对齐窗口。
 module fquick (
     input  wire [31:0] a,
     input  wire        a_sign,
@@ -30,6 +34,7 @@ module fquick (
     output wire [31:0] result,
     output wire [ 4:0] fflags
 );
+
 
     
     wire [31:0] class_result =
@@ -139,3 +144,4 @@ module fquick (
                     ({32{fquick_op[0]}} & max_result);
 
 endmodule
+/* verilator lint_on UNUSEDSIGNAL */

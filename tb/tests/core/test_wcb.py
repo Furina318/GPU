@@ -72,7 +72,6 @@ async def idle(dut) -> None:
     dut.mg_line.value = 0
     for w in range(WORDS):
         dut.mg_data_in[w].value = 0
-    dut.flush_req.value = 0
     dut.out_ready.value = 0
 
 
@@ -120,15 +119,14 @@ async def merge(dut, line: int, data: list[int]):
     return [int(dut.mg_data_out[w].value) for w in range(WORDS)]
 
 
-async def flush(dut, max_cycles: int = 64):
-    """拉起 flush_req, 逐项接受 out 端, 直到 flush_done。
+async def drain(dut, max_cycles: int = 64):
+    """把缓冲里的项全部交出去(下游恒 ready), 直到缓冲空且输出口不再有效。
 
     ``out_valid``/``out_*`` 是组合输出: 本拍驱动之后要先让组合逻辑稳定下来
     (cocotb 写值在下一个 delta 才生效), 再在同一拍内采样; 上沿一过被接受的
     那项就被移除了, 晚一拍会漏记。
     """
     await FallingEdge(dut.clk)
-    dut.flush_req.value = 1
     dut.out_ready.value = 1
     await Timer(1, "ns")
     written: list[tuple[int, int, list[int]]] = []
@@ -138,16 +136,14 @@ async def flush(dut, max_cycles: int = 64):
             written.append((int(dut.out_line.value),
                             int(dut.out_wen.value),
                             [int(dut.out_wdata[w].value) for w in range(WORDS)]))
-        done = int(dut.flush_done.value)
+        if int(dut.empty.value) and not int(dut.out_valid.value):
+            break
         await RisingEdge(dut.clk)
         cycles += 1
-        if done:
-            break
         if cycles > max_cycles:
-            raise AssertionError("flush 超时")
+            raise AssertionError("drain 超时")
         await FallingEdge(dut.clk)
         await Timer(1, "ns")
-    dut.flush_req.value = 0
     dut.out_ready.value = 0
     await FallingEdge(dut.clk)
     return written
@@ -187,7 +183,7 @@ async def test_write_read_bypass_merge(dut):
 
 
 @cocotb.test()
-async def test_capacity_and_flush(dut):
+async def test_capacity_and_drain(dut):
     sb = Scoreboard("wcb-flush")
     await fresh(dut)
     m = WcbModel()
@@ -202,7 +198,7 @@ async def test_capacity_and_flush(dut):
     await store(dut, 0x20, 0x01, wdata)
     m.store(0x20, 0x01, wdata)
 
-    written = await flush(dut)
+    written = await drain(dut)
     want = {ln: (ok, tuple(dat[w] for w in range(WORDS) if (ok >> w) & 1))
             for ln, (ok, dat) in m.items.items()}
     got = {}
@@ -246,7 +242,7 @@ async def test_random_sequence(dut):
             sb.check_equal(masked(got, m.read(line, 0xFF)[0] and 0xFF or 0xFF),
                            masked(m.merge(line, mem), 0xFF), f"step{step} 读合并")
         if step % 97 == 96:
-            written = await flush(dut)
+            written = await drain(dut)
             want = {ln: (ok, tuple(dat[w] for w in range(WORDS) if (ok >> w) & 1))
                     for ln, (ok, dat) in m.items.items()}
             got = {ln: (ok, tuple(dat[w] for w in range(WORDS) if (ok >> w) & 1))

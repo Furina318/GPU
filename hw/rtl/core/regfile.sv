@@ -2,7 +2,6 @@
 
 module regfile (
     input  wire                 clk          ,
-    input  wire                 rst          ,
     input  wire                 valid        ,
 
     input  wire [`CLOG_GPR-1:0] gpr_wr_addr  ,

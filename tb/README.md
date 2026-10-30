@@ -160,7 +160,7 @@ tb/
 │   ├── test_shared_mem.py  # 8 banks, broadcast, conflict billing, errors
 │   ├── test_lsu_coalescer.py # 8 lanes -> N 32B line requests
 │   ├── test_mem_map.py     # address-space decode + MMIO / hole errors
-│   ├── test_wcb.py         # write-combine buffer: merge, bypass, flush
+│   ├── test_wcb.py         # write-combine buffer: merge, bypass, drain
 │   ├── test_global_mem.py  # line read/store through the real AXI path
 │   ├── test_lsu.py         # per-warp LSU: shared + coalesced global
 │   ├── test_lsu_scheduler.py # per-SM arbitration between the 4 warps
@@ -222,9 +222,9 @@ model follows RISC-V (every NaN-producing arithmetic op returns the canonical
 
 ## 5. What is covered
 
-118 tests over 22 DUT configurations: 30 on the FPU (all green on **both**
+120 tests over 22 DUT configurations: 30 on the FPU (all green on **both**
 simulators, stable across `TB_SEED=0..11` -- a 12-seed sweep is a good regression
-to run after any RTL change) plus 87 on the shader core front end, the memory
+to run after any RTL change) plus 89 on the shader core front end, the memory
 subsystem, the LSU, the SM top level and the command processor (Verilator only,
 see below):
 
@@ -260,11 +260,11 @@ because findings A and B were protocol bugs:
 | `lsu_coalescer` | 2 | the four ISA §3.2 cases (consecutive / broadcast / masked / scattered), a store case checking per-word `req_wen`, and 300 random accesses diffed against an independent grouping model |
 | `shared_mem` | 6 | 8-lane conflict-free round-trip, broadcast (all lanes one address), same-bank conflict (`conflict_extra = max_b(distinct) - 1`), masked-lane exclusion, `BAD_ALIGN`/OOB (nothing executes), and 120 random warp accesses diffed against an independent array model |
 | `mem_map` | 2 | 16 boundary probes (MMIO / command queue / constant / image / semaphore / framebuffer / DDR / hole) plus 500 random addresses diffed against an independently written region table |
-| `wcb` | 3 | store-merge then read bypass, partial-line hits, merge into an AXI-returned line, capacity + flush handshake, and a 400-step random sequence against a dict model |
+| `wcb` | 3 | store-merge then read bypass, partial-line hits, merge into an AXI-returned line, capacity + drain (buffer holds 8 entries, hands rows out only when the downstream is ready), and a 400-step random sequence against a dict model |
 | `global_mem` | 4 | whole-line read (8-beat burst) from a Verilog AXI RAM model, partial-lane store + flush + untouched lanes keep memory, WCB-all-hit read that must **not** issue an AXI read, and 12 lines (over the 8-entry WCB) under back-pressure |
 | `lsu` | 6 | shared load/store, cross-line global load (2 line requests in ascending line order), store word-index mapping, `BAD_ALIGN`, `MMIO_ACCESS` and `NO_MEM_REGION` |
 | `lsu_scheduler` | 4 | shared-port round-robin between two warps, store routed to the WCB (no read request), load response routed back to its owner, and the flush owner handshake |
-| `core` | 11 | end-to-end kernels on the SM top: 8-lane broadcast store, `ld.g`+add+`st.g` (line read + write merge), 4 warps using `tmov`/`wmov` to write `4*(tid+wid*8)`, 2 warps doing `st.s` → `bar.sync` → `ld.s` (shared memory + barrier flush), `divu`/`x/0`/`mul` through the MDU, `fmul`/`fadd`/`fma.f32` through the shared FPU, per-lane FP with lane-distinct inputs, an 8-lane **24B-stride** load spanning 6 lines, the **real** `sw/kernels/gouraud.S` (single warp, 8 vertices, affine result + colour pass-through checked bit-for-bit), a predicated write whose false lanes must not commit, and an 8-round `loop` guarded by `setp` on **p3** (regression for the one-hot `setp_pdst` truncation that turned p3 writes into p0) |
+| `core` | 12 | end-to-end kernels on the SM top: 8-lane broadcast store, `ld.g`+add+`st.g` (line read + write merge), 4 warps using `tmov`/`wmov` to write `4*(tid+wid*8)`, 2 warps doing `st.s` → `bar.sync` → `ld.s` (shared memory + barrier flush), `divu`/`x/0`/`mul` through the MDU, `fmul`/`fadd`/`fma.f32` through the shared FPU, per-lane FP with lane-distinct inputs, an 8-lane **24B-stride** load spanning 6 lines, the **real** `sw/kernels/gouraud.S` (single warp, 8 vertices, affine result + colour pass-through checked bit-for-bit), a predicated write whose false lanes must not commit, and an 8-round `loop` guarded by `setp` on **p3** (regression for the one-hot `setp_pdst` truncation that turned p3 writes into p0), and **two launches of the same SM** (a second kernel must actually run — regression for warps that stayed stuck in `W_EXIT` after the first `exit`) |
 | `cp_adapter` | 3 | CP line/word read through `cp_mem_adapter` (two 8-beat bursts for 64B, unaligned start still reads the whole line) and a word read + write round trip |
 | `axi_arb` | 4 | two masters reading concurrently (one burst at a time), CP priority, a full AW/W/B write burst, and back-to-back reads from the same master |
 

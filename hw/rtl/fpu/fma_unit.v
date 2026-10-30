@@ -6,6 +6,10 @@
 //   stage1：乘积合并、公共 LSB 对齐移位、被移出低位折入 sticky
 //   stage2：有符号宽加、取模、前导零计数、规范化/次正规化 G/R/S 舍入、打包
 
+/* verilator lint_off UNUSEDSIGNAL */
+// 浮点数据通路按算法保留满位宽(尾数 + 保护位 + 粘滞位 + 进位链余量),
+// 其中若干输入/中间位只在特定的舍入或异常路径上参与判决 —— 这些
+// "未使用"是刻意留的位宽, 删掉会改变进位链与对齐窗口。
 module fma_unit #(
     parameter ID_WIDTH = 5
 )(
@@ -40,6 +44,7 @@ module fma_unit #(
     output wire [        31:0] wb_result  ,
     output wire [         4:0] wb_fflags
 );
+
 
     wire is_fadd   = (op == `FADD_S);
     wire is_fsub   = (op == `FSUB_S);
@@ -828,3 +833,4 @@ module fma_csa(
     assign s = a ^ b ^ cin;
     assign cout = a & b | b & cin | a & cin;
 endmodule
+/* verilator lint_on UNUSEDSIGNAL */

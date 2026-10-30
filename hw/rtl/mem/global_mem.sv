@@ -5,8 +5,8 @@
 //
 //  * `ld.g` : 32B 行请求 → WCB 读旁路,未命中才发 AXI4 读(arlen=7 的 8×4B burst),
 //             回来的行再用 WCB 里"写过但还没写出去"的字叠加(store→load 可见);
-//  * `st.g` : 先进 WCB 按行合并,`flush_req`(`bar.sync`/`exit`)或 WCB 满时才真正
-//             写出去(AW + 8 拍 W,每拍 wstrb 标记该 4B 字是否有效);
+//  * `st.g` : 先进 WCB 按行合并,再按行写出去(AW + 8 拍 W,每拍 wstrb 标记该
+//             4B 字是否有效);`flush_req` 等缓冲排空且写通路空闲才回 done。
 //  * 总线错误(`rresp/bresp != OKAY`)通过 `rsp_err` 上报,由 LSU 转成 `BUS_ERROR`。
 //
 //  v1 每 SM 单次在飞:一次只挂一个读/一个写,协议面小;参考模型有 4 项在飞,
@@ -88,7 +88,7 @@ module global_mem (
     logic [7:0][31:0]       wcb_rd_data;
     logic [7:0][31:0]       bus_line;         // 总线回来的行(含最后一拍)
     logic [7:0][31:0]       mg_out;           // WCB 叠加后的行
-    logic                   wcb_flush_req, wcb_flush_done, wcb_empty, wcb_full;
+    logic                   wcb_empty, wcb_full;
     logic                   wcb_out_valid, wcb_out_ready;
     logic [26:0]            wcb_out_line;
     logic [7:0]             wcb_out_wen;
@@ -109,8 +109,6 @@ module global_mem (
         .mg_line    (rsp_line),
         .mg_data_in (bus_line),
         .mg_data_out(mg_out),
-        .flush_req  (wcb_flush_req),
-        .flush_done (wcb_flush_done),
         .empty      (wcb_empty),
         .full       (wcb_full),
         .out_valid  (wcb_out_valid),
@@ -121,15 +119,6 @@ module global_mem (
     );
 
     assign wr_ready = wcb_wr_ready;
-
-    // 冲刷: 上层要求, 或 WCB 满了要腾地方(自动)
-    // 自动冲刷用"输出通道空且缓冲非空且未在冲刷"的门控, 避免把每笔写都退化成
-    // 单行 AXI 写(这样连续 store 到不同行才不会被永久背压)。
-    // 只在"缓冲满、放不下新的一项"时才自动冲刷腾位置;
-    // 平时的写先留在 WCB 里合并, 由上层在 bar.sync / FENCE 处显式 flush。
-    logic auto_flush;
-    assign auto_flush = wcb_full;
-    assign wcb_flush_req = flush_req | auto_flush;
 
     // 冲刷完成 = 缓冲空 + 写通路回到空闲。只看 wcb 的"缓冲已空"不够:
     // 最后一项被取走后 AXI 写还在飞, 此时回 done 会让上层以为数据已落盘。

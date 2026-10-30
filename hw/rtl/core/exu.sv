@@ -1,5 +1,4 @@
 `include "defines.vh"
-import core_pkg::*;
 
 // ============================================================================
 //  exu —— 每 warp 一个的执行单元
@@ -13,7 +12,7 @@ import core_pkg::*;
 //  完成时给 `wbu` 送一次写回(单拍脉冲 `wb_valid`)。
 // ============================================================================
 
-module exu #(
+module exu import core_pkg::*; #(
     parameter int LANES = `WARP_SIZE
 ) (
     input  wire                     clk         ,
@@ -21,7 +20,7 @@ module exu #(
     /* verilator lint_off UNUSEDSIGNAL */
     input  wire                     warp_active ,   // 本 warp 还没 exit(core 侧用停机控制)
     /* verilator lint_on UNUSEDSIGNAL */
-    input  wire [1:0]               warp_id     ,   // wmov 用(= wid)
+    input  wire [2:0]               warp_id     ,   // wmov 用(= wid), 支持到每 SM 8 个 warp
 
     // ---- 译码结果与操作数(来自 regfile) ----
     input  wire core_pkg::dec_info_t dec        ,
@@ -150,14 +149,17 @@ module exu #(
     //  FSM
     // ======================================================================
     typedef enum logic [2:0] {
-        E_IDLE, E_LSU, E_MDU, E_MDU_WB, E_FPU, E_FPU_WB, E_DONE
+        E_IDLE, E_LSU, E_MDU, E_FPU, E_WB, E_DONE
     } exu_state_t;
 
     exu_state_t st;
 
     logic [LW-1:0]  lane_q;          // MDU 串行: 当前 lane
     logic [31:0]    pc_q, inst_q;
+    /* verilator lint_off UNUSEDSIGNAL */
+    // 只锁存用得到的字段(wr_gpr/rd/fpu_op/frm/imad_en/...), 其余位宽留着不影响
     dec_info_t      dec_q;
+    /* verilator lint_on UNUSEDSIGNAL */
     logic [LANES-1:0] mask_q;
     logic [LANES-1:0][31:0] rs1_q, rs2_q;
     logic [LANES-1:0]       wb_acc_done;
@@ -184,10 +186,12 @@ module exu #(
     logic        mdu_en, mdu_ack;
     logic        mdu_ready, mdu_done;
     logic [31:0] mdu_src1, mdu_src2, mdu_result;
+    /* verilator lint_off UNUSEDSIGNAL */
+    // mdu 的完成现场(rd / gpr_we / pc / inst)本层不用: 写回用的是指令自身的
+    // dec_q.rd / dec_q.wr_gpr, 这样即使 MDU 的完成队列有偏也不会串到别的 lane。
     logic [4:0]  mdu_rd_done;
     logic        mdu_gpr_we_done;
-    /* verilator lint_off UNUSEDSIGNAL */
-    logic [31:0] mdu_pc_done, mdu_inst_done;   // mdu 现场, 本层不需要
+    logic [31:0] mdu_pc_done, mdu_inst_done;
     /* verilator lint_on UNUSEDSIGNAL */
 
     mdu u_mdu (
@@ -253,7 +257,7 @@ module exu #(
                 else if (dec.is_tmov)
                     wb_now[li] = li[31:0];              // tid
                 else if (dec.is_wmov)
-                    wb_now[li] = {30'h0, warp_id};              // wid
+                    wb_now[li] = {29'h0, warp_id};              // wid(3 位)
                 else if (dec.alu_en)
                     wb_now[li] = alu_res[li];
             end
@@ -378,7 +382,7 @@ module exu #(
                         if (|(mask_q & ~wb_acc_done & ~({{(LANES-1){1'b0}}, 1'b1} << lane_q))) begin
                             lane_q <= next_lane(lane_q, mask_q & ~wb_acc_done);
                         end else begin
-                            st <= E_MDU_WB;
+                            st <= E_WB;
                         end
                     end
                 end
@@ -394,20 +398,14 @@ module exu #(
                         if (|(mask_q & ~wb_acc_done & ~({{(LANES-1){1'b0}}, 1'b1} << lane_q))) begin
                             lane_q <= next_lane(lane_q, mask_q & ~wb_acc_done);
                         end else begin
-                            st <= E_FPU_WB;
+                            st <= E_WB;
                         end
                     end
                 end
 
-                E_FPU_WB: begin
-                    wb_valid    <= 1'b1;
-                    wb_gpr_we   <= dec_q.wr_gpr;
-                    wb_gpr_addr <= dec_q.rd;
-                    wb_gpr_data <= wb_acc;
-                    st          <= E_DONE;
-                end
-
-                E_MDU_WB: begin
+                // MDU 与 FPU 扫完所有 lane 后共用同一个写回拍:
+                // 目标寄存器与写使能都取自指令自身(dec_q), 不依赖单元的完成队列。
+                E_WB: begin
                     wb_valid    <= 1'b1;
                     wb_gpr_we   <= dec_q.wr_gpr;
                     wb_gpr_addr <= dec_q.rd;

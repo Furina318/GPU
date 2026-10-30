@@ -50,8 +50,11 @@ package cp_pkg;
     // bit2 USES_GLOBAL_WRITE 只是提示(CP/FENCE 可据此省一次冲刷), 本实现不用
     localparam int FLAG_REQUIRES_SINGLE_SM= 3;
 
-    // cmd_flags
+    // cmd_flags(CMDS §4.1): bit0 = CMD_SYNC 目前没有使用者 —— CP 执行完一条
+    // 命令本来就已经把写缓冲冲干净了, 保留编号以免以后的扩展挪位。
+    /* verilator lint_off UNUSEDPARAM */
     localparam int CFLAG_SYNC        = 0;
+    /* verilator lint_on UNUSEDPARAM */
     localparam int CFLAG_IRQ_ON_DONE = 1;
 
     // IRQ 位

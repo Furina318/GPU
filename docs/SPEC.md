@@ -1,6 +1,6 @@
 # SPEC.md —— SimpleGPU 系统规格与模块接口
 
-版本 0.6 · 关联文档:`ISA.md`(Shader 核)/ `CMDS.md`(命令集)/ `GFX.md`(2D 引擎)· 变更记录见 [附录 A](#附录-a变更记录)
+版本 0.7 · 关联文档:`ISA.md`(Shader 核)/ `CMDS.md`(命令集)/ `GFX.md`(2D 引擎)· 变更记录见 [附录 A](#附录-a变更记录)
 
 > **读者指引**
 >
@@ -15,7 +15,7 @@
 
 ## 1. 系统组成
 
-一台**固定功能 + 可编程**混合的教学 GPU:一个命令处理器(CP)、两个 SIMT 着色器核(SM)、
+一台**固定功能 + 可编程**混合的简单 GPU:一个命令处理器(CP)、两个 SIMT 着色器核(SM)、
 一个矩阵引擎、一个 2D 引擎,共享一套内存子系统与 host 接口(MMIO + 命令环)。
 
 ```
@@ -165,7 +165,7 @@ SIMT 栈 8 深/warp(12B/帧,96B/warp)。
 | 方向 | 端口 | 说明 |
 |---|---|---|
 | in | `master_req/rsp`(多主) | CP 的 DMA + 2 个 SM 的访存 + 各引擎,仲裁后走 AXI4 主口 |
-| — | 写合并缓冲 | 每 SM 一个(约 4–8 项):`st.g` 先入缓冲、按地址合并;`exit` 与 `bar.sync` 负责冲刷 |
+| — | 写合并缓冲 | 每 SM 一个(8 项 × 32B 行):`st.g` 先入缓冲、按行按字合并;写引擎空闲时按行写出,`exit`/`bar.sync` 等它排空且写通路回空闲才算可见 |
 | — | 共享内存 / 指令 SRAM | 每 SM 各 16KB,物理上 SM 私有(文件在 `hw/rtl/mem/`,由 SM 顶层实例化) |
 
 **契约**:
@@ -229,7 +229,7 @@ RTL 综合后要回来标定 `ISA.md` §8.1 的目标值。
 | 入口 | 覆盖内容 |
 |---|---|
 | `cd sim/simulator && make test` | 文档审计(`tests/doc_consistency_check.py`:章节引用、目录锚点、变更记录编号、跨文档编码一致)+ ISA 表↔汇编器↔译码器往返(`isa_ref_check.py`)+ SIMT 栈状态机的独立实现(`stack_model_check.py`)+ 功能回归(`tests/run_tests.py`:错误路径、运行模式、2D 引擎逐像素对拍、car demo、`sg` 编译器) |
-| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(22 个 DUT 配置、117 个用例);`--werror` 打开严格 lint |
+| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(22 个 DUT 配置、120 个用例);`--werror` 打开严格 lint |
 | `cd sim/run-sim && make check` | RTL 全系统仿真:CP + 2×SM + 内存子系统 + DDR 连起来跑 `clear`/`gouraud`/`matmul`,结果与参考模型逐位对拍 |
 
 - **参考模型是独立的第二实现**:shader 核(`sim/simulator/shader/`)、2D 引擎(`2D-engine/gfx2d.cpp` + `tests/gfx2d_ref.py`)、CP(`src/cp.cpp`)、内存子系统(`sim/simulator/src/memory.cpp`)。RTL 与模型逐位对齐,不允许"自证":同一个 `.S` 内核在两套实现上跑,结果按位比较(`sim/run-sim/`)。
@@ -260,6 +260,7 @@ RTL 综合后要回来标定 `ISA.md` §8.1 的目标值。
 | 2 | v0.3 | 与 `GFX.md` 闭环:§1 模块表补 2D 引擎的规格出处、§2 的帧缓冲几何改为"2D 引擎寄存器"、§3.5 按接口重写、§5 权威表定稿、§7-1/§7-2 改写与关闭;修正三处指向不存在章节的引用 |
 | 3 | v0.4 | 2D 引擎与 `sg` 编译器落地回填(§1、§3.5、§6);§3.2 的 SM 取指口补 `valid` 与 1 拍回读延迟;§3.1 按 RTL 重写预加载口与 `engine_cmd` 流,并补 MMIO 访问模型契约 5–7;§7 第 8 项关闭(命令环填充粒度定在 `CMDS.md` §2.1) |
 | 4 | v0.5 | 手册化:§6 改为"验证与工具链"(原开发流程叙述移至 `docs/HISTORY.md` §5),§7 待定项改为现状表,附录压缩为版本摘要,头部加读者指引 |
-| 5 | v0.6(本次) | §6 增加 RTL 全系统仿真入口(`sim/run-sim/`,22 个 RTL DUT 配置 / 117 个用例);内存子系统落到 RTL 后 `memory.cpp` 正式列为第二实现 |
+| 5 | v0.6 | §6 增加 RTL 全系统仿真入口(`sim/run-sim/`,22 个 RTL DUT 配置);内存子系统落到 RTL 后 `memory.cpp` 正式列为第二实现 |
+| 6 | v0.7(本次) | §3.4 写合并缓冲的写出时机按 RTL 写清(不再有独立的冲刷请求端口);§6 用例数更新为 120 |
 
 > 每条改动的理由与跨文档冲突的处置过程见 `docs/HISTORY.md`;逐条提交记录见 `git log`。

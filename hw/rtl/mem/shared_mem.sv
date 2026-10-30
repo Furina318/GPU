@@ -42,7 +42,6 @@ module shared_mem #(
     localparam int WORDS      = SIZE_BYTES / 4;
     localparam int WORDS_BANK = WORDS / BANKS;
     localparam int IDX_W      = $clog2(WORDS_BANK);   // 9
-    localparam int SIZE_W     = $clog2(SIZE_BYTES);   // 14
 
     typedef enum logic [1:0] { S_IDLE, S_ROUND, S_DONE } state_t;
     state_t st, st_n;

@@ -1,6 +1,6 @@
 # SimpleGPU
 
-一个自顶向下、文档驱动的教学级 GPU:从指令集、命令处理器、着色器核,一路到 2D 引擎、矩阵引擎与共享 AXI4 内存子系统;带两套可运行的参考模型(RTL 仿真 + C++ 全系统模拟器)、一套自定义着色语言的编译器,以及覆盖"正例 + 错误路径"的回归测试。
+一个自顶向下、文档驱动的简单级 GPU:从指令集、命令处理器、着色器核,一路到 2D 引擎、矩阵引擎与共享 AXI4 内存子系统;带两套可运行的参考模型(RTL 仿真 + C++ 全系统模拟器)、一套自定义着色语言的编译器,以及覆盖"正例 + 错误路径"的回归测试。
 
 **从这里开始读**:想写内核 → [ISA 手册](docs/ISA.md);想写驱动 → [命令集手册](docs/CMDS.md);想画 2D 图形 → [2D 引擎手册](docs/GFX.md);想改 RTL → [系统接口规格](docs/SPEC.md) 与各模块的 `*.md` 设计说明。
 
@@ -53,14 +53,24 @@ make sg                   # sw/sg/*.sg → build/sg/*.bin
 
 # 4) RTL 单元/子系统测试(cocotb + Verilator)
 cd tb && make setup       # 一次性:安装固定版本 Verilator 到 tb/.tools
-make test                 # 跑全部 22 个 DUT 配置 / 118 个用例
+make test                 # 跑全部 22 个 DUT 配置 / 120 个用例
 make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
 
 # 5) RTL 全系统仿真:整颗 GPU(CP + 2×SM + 内存子系统 + DDR)跑真实内核
-cd sim/run-sim && make    # 编译(约 8 分钟,只在 RTL 变了才需要重来)
-make check                # 跑 clear / gouraud / matmul / anim 并与参考模型逐位对拍
-make demo                 # anim 动画: SDL 窗口逐帧重算并显示(关窗或 ESC 结束)
+make -C sim/run-sim                                   # 编译(只有 RTL 变了才需要重来)
+make -C sim/run-sim run ARGS="--image clear --warps 8"      # 唯一入口: 参数都写进 ARGS
+make -C sim/run-sim run ARGS="--image anim --view"          # SDL 窗口逐帧显示
+make -C sim/run-sim run ARGS="--image matmul --fst wave.fst" # 存 FST 波形
+make -C sim/run-sim check     # 依次跑 clear / gouraud / matmul / anim 并与参考模型逐位对拍
 ```
+
+`--image` 直接给内核名(`clear` / `gouraud` / `matmul` / `anim`),测试台自己到
+`sim/simulator/build/` 里找对应镜像,不必 `cd`、也不必写 `build/clear.bin`;
+`--kernel` 会按 `--image` 推断,反过来也成立,所以两个写一个就够。
+`--view`(SDL 窗口)/ `--ascii`(终端真彩色)/ `--ppm-dir DIR`(逐帧写 ppm)
+任选,`--no-verify` 跳过校验,`--fst FILE` 存波形;`make run ARGS="--help"` 列出全部
+选项。为什么参数不直接写在 `make run` 后面:GNU make 会先吃掉 `--image` 之类自己的
+选项(报 `unrecognized option`),所以统一走 `ARGS="..."`。
 
 ## 3. 目录结构
 
@@ -74,7 +84,7 @@ make demo                 # anim 动画: SDL 窗口逐帧重算并显示(关窗�
 | `sim/simulator/` | C++ 全系统模拟器:参考模型(`src/`、`shader/`、`2D-engine/`)、内核校验、demo、调试器 |
 | `sim/run-sim/` | RTL 全系统仿真:Verilator 测试台把 CP + 2×SM + 内存子系统连起来跑 `sw/kernels/*.S` |
 | `sw/` | 汇编器 `assembly.py`、sg 语言编译器 `compiler.py`、内核 `kernels/*.S`、demo `demo/`、语言手册 `grammer.md` |
-| `tb/` | cocotb 测试平台:22 个 DUT 配置、118 个用例;`README.md` 是测试指南 |
+| `tb/` | cocotb 测试平台:22 个 DUT 配置、120 个用例;`README.md` 是测试指南 |
 
 ## 4. 文档地图
 
@@ -113,4 +123,4 @@ make demo                 # anim 动画: SDL 窗口逐帧重算并显示(关窗�
 - 文档与实现必须同时改;改动摘要追加到各文档的"变更记录"表,编号唯一递增(`docs/HISTORY.md` 只存档过程,不是权威)。
 - 设计文档放在对应 RTL 旁边(`hw/rtl/cp/cp.md`、`hw/rtl/fpu/README.md`、`hw/rtl/cache/README.md`),`docs/` 下只放四份权威手册与历史存档。
 - 每条规则引到具体章节(`§N.M`),交叉引用只指向存在的编号;`sim/simulator/tests/doc_consistency_check.py` 会机械校验这些约束,`make test` 的通过与否以它为准。
-- 仓库面向教学:规模化数字(周期数、吞吐)都是设计目标或实测估算,不是签核数据。
+- 仓库面向学习:规模化数字(周期数、吞吐)都是设计目标或实测估算,不是签核数据。

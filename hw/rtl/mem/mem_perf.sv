@@ -1,29 +1,17 @@
 `include "defines.vh"
 
-// ============================================================================
-//  mem_perf —— 内存子系统计数器(SPEC §3.4、ISA §8.1)
-//
-//  计数器与参考模型(sim/simulator 的 RunStats)同名同义, 只做"数事件",
-//  不参与控制:
-//    gmem_lines    一次 32B 行请求(读/写各算一次)
-//    shared_extra  共享内存冲突额外拍(`shared_mem.conflict_extra` 累加)
-//    mmio_access   内核访问 MMIO 窗口被拒的次数(ISA §2.6 MMIO_ACCESS)
-//    unmapped      内核访问未映射地址被拒的次数(NO_MEM_REGION)
-//
-//  计数器在 `clear` 有效时清零(与 CP 的"写任意值清零"风格一致), 便于主机
-//  按区间算增量: 读一次、清一次, 不必等到 32 bit 回绕。
-// ============================================================================
+//  mem_perf —— 内存子系统计数器
 
 module mem_perf (
-    input  wire        clk,
-    input  wire        rst,
-    input  wire        clear,             // 单拍脉冲: 全部计数器清零
+    input  wire         clk,
+    input  wire         rst,
+    input  wire         clear,             // 单拍脉冲: 全部计数器清零
 
     // 事件输入
-    input  wire        ev_line,           // 一次 32B 行请求(读或写)
-    input  wire [3:0]  ev_shared_extra,   // 共享内存冲突额外拍
-    input  wire        ev_mmio,           // MMIO_ACCESS
-    input  wire        ev_unmapped,       // NO_MEM_REGION
+    input  wire         ev_line,           // 一次 32B 行请求(读或写)
+    input  wire  [ 3:0] ev_shared_extra,   // 共享内存冲突额外拍
+    input  wire         ev_mmio,           // MMIO_ACCESS
+    input  wire         ev_unmapped,       // NO_MEM_REGION
 
     // 计数器
     output logic [31:0] ctr_lines,

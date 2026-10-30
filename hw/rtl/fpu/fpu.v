@@ -31,7 +31,6 @@ module fpu #(
     wire is_fsgnj   = (fpu_op == `FSGNJ_S );
     wire is_fsgnjn  = (fpu_op == `FSGNJN_S);
     wire is_fsgnjx  = (fpu_op == `FSGNJX_S);
-    wire is_fsgnj_all = (fpu_op[6:3] == 4'b0101);
 
     wire is_fclass = (fpu_op == `FCLASS_S);
     wire is_fmin   = (fpu_op == `FMIN_S  );

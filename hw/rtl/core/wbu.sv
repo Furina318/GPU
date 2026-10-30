@@ -1,8 +1,6 @@
 `include "defines.vh"
 
 module wbu (
-    input  wire                     clk            ,
-    input  wire                     rst            ,
     input  wire                     valid          ,
 
     input  wire [`WARP_SIZE-1:0]    effective_mask ,

@@ -1,7 +1,6 @@
 `include "defines.vh"
-import core_pkg::*;
 
-module alu(
+module alu import core_pkg::*; (
   input  alu_op_t     alu_op    ,
   input  logic [31:0] alu_src1  ,
   input  logic [31:0] alu_src2  ,
@@ -16,7 +15,7 @@ module alu(
     logic [31:0] adder_result;
     logic        adder_cout;
     assign adder_sum = 33'(alu_src1)
-                     + 33'(use_sub ? ~alu_src2 : alu_src2)
+                     + (use_sub ? {1'b0, ~alu_src2} : {1'b0, alu_src2})
                      + 33'(use_sub);
     assign {adder_cout, adder_result} = adder_sum;
 

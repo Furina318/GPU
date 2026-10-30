@@ -1,5 +1,6 @@
 `include "defines.vh"
 
+// 把 host 的 AXI4-Lite 总线协议(5 个通道)转换成 CP 内部寄存器文件(cp_regs)需要的单周期脉冲式读写接口
 module axil_slave (
     input  wire         clk        ,
     input  wire         rst        ,
@@ -46,6 +47,7 @@ module axil_slave (
     assign reg_wr    = aw_got & w_got & ~b_pending & ~aw_bad & (|s_wstrb);
     assign reg_addr  = reg_wr ? aw_addr : ar_addr;
     assign reg_wdata = w_data;
+    // 写优先
     assign reg_rd    = ar_got & ~r_pending & ~reg_wr & ~ar_bad;
 
     assign s_awready = ~aw_got & ~b_pending;
@@ -58,6 +60,7 @@ module axil_slave (
     assign s_rdata   = r_data;
     assign s_rresp   = RESP_OKAY;
 
+    // 每通道单事务在途
     always_ff @(posedge clk) begin
         if (rst) begin
             aw_got  <= 1'b0;  w_got     <= 1'b0; b_pending <= 1'b0;

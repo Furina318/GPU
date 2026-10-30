@@ -531,3 +531,48 @@ done:
             sb.check_int(g.peek(0x1000_0000 + i * 32 + lane * 4), i,
                          f"第 {i} 轮第 {lane} lane")
     sb.report()
+
+
+@cocotb.test()
+async def test_relaunch(dut):
+    """同一个 SM 连跑两个内核。
+
+    回归:`hw/rtl/core/core.sv` 里每 warp 的状态机在 launch 时不回 `W_IDLE`;
+    不修的话上一轮停在 `W_EXIT` 的 warp 永远留在那儿,第二个内核根本不执行。
+    """
+    sb = Scoreboard("core-relaunch")
+    fresh(dut)
+    await tick(dut, 3)
+    dut.rst.value = 0
+
+    prog_a = """
+        lui  r10, 0x10000
+        addi r1, r0, 7
+        tmov r2, tid
+        slli r3, r2, 2
+        add  r3, r10, r3
+        add  r4, r1, r2
+        st.g 0(r3), r4
+        exit
+    """
+    ga = GMem()
+    done, err, pc = await run_kernel(dut, prog_a, num_warps=1, gmem=ga)
+    sb.check_int(done, 1, "第一个内核应当完成")
+    sb.check_int(err, 0, "第一个内核不该报错")
+    for lane in range(8):
+        sb.check_int(ga.peek(0x1000_0000 + 4 * lane), 7 + lane,
+                     f"第一个内核 lane{lane} 写入 {7 + lane}")
+
+    prog_b = """
+        lui  r10, 0x10000
+        addi r1, r0, 100
+        st.g 0x10(r10), r1
+        exit
+    """
+    gb = GMem()
+    done, err, pc = await run_kernel(dut, prog_b, num_warps=1, gmem=gb)
+    sb.check_int(done, 1, "第二个内核应当完成")
+    sb.check_int(err, 0, "第二个内核不该报错")
+    sb.check_int(gb.peek(0x1000_0010), 100, "第二个内核真的执行了")
+
+    sb.report()

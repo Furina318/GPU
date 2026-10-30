@@ -16,6 +16,9 @@
 //    · 读:AR 被接受后逐拍给 rvalid,`rlast` 在最后一拍置起。
 // ============================================================================
 
+/* verilator lint_off UNUSEDSIGNAL */
+// 地址只在字粒度上有意义: 低 2 位(字节偏移)被 burst 的逐拍 4B 步进取代,
+// 高 7 位超出 `DEPTH_WORDS` 的寻址范围 —— 这两段地址位有意不参与译码。
 module axi_ram_model #(
     parameter int DEPTH_WORDS = 1 << 16,   // 默认 256KB
     parameter     INIT_FILE   = ""         // 非空则 $readmemh 预载
@@ -159,3 +162,4 @@ module axi_ram_model #(
     end
 
 endmodule
+/* verilator lint_on UNUSEDSIGNAL */

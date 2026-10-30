@@ -89,4 +89,7 @@
 `define UNUSED_PIN(x)   /* verilator lint_off PINCONNECTEMPTY */ \
                         . x () \
 
+`define ZERO_PIN(x)     /* verilator lint_off PINCONNECTEMPTY */ \
+                        . x(0) \
+
 `endif // DEFINES_VH

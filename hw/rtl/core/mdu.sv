@@ -1,7 +1,10 @@
 `include "defines.vh"
-import core_pkg::*;
 
-module mdu (
+/* verilator lint_off UNUSEDSIGNAL */
+// 乘法/除法的中间结果按算法保留满位宽(69 位的乘积累加、6 位的注入常量等),
+// 其中若干高位只在 mulhu/divu/remu 这类路径之外用不到 —— 这些"未使用"是
+// 刻意留的位宽, 删掉会改变进位链结构, 所以在这里统一屏蔽 UNUSEDSIGNAL。
+module mdu import core_pkg::*; (
     input  wire                      clk          ,
     input  wire                      rst          ,
     input  wire                      mdu_en       ,
@@ -137,6 +140,7 @@ module mdu (
 
     function [5:0] clz32;
         input [31:0] v;
+        /* verilator lint_off VARHIDDEN */   // 与模块里的 genvar i 同名, 函数内不影响
         reg [5:0] i;
         begin
             clz32 = 32;
@@ -147,6 +151,7 @@ module mdu (
                 end
         end
     endfunction
+    /* verilator lint_on VARHIDDEN */
 
     wire src1_sign = mdu_src1[31];
     wire src2_sign = mdu_src2[31];
@@ -375,6 +380,9 @@ module mdu (
 
 endmodule
 
+// walloc_17bits / csa 是 mdu 私有的 Wallace 树与进位保存加法器, 体积小且只服务于
+// 这一个文件, 所以没有单独拆文件 —— 文件名与模块名不一致是有意的。
+/* verilator lint_off DECLFILENAME */
 module walloc_17bits(
     input  logic [16:0] src_in,
     input  logic [13:0] cin,
@@ -421,3 +429,6 @@ module csa (
     assign cout = (a & b) | (b & cin) | (cin & a);
     assign s    = a ^ b ^ cin;
 endmodule
+
+/* verilator lint_on DECLFILENAME */
+/* verilator lint_on UNUSEDSIGNAL */

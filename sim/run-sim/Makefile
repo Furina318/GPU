@@ -1,30 +1,34 @@
-# sim/run-sim/Makefile —— RTL 全系统仿真的入口
-#
-#   make            编译 sim/run-sim/build/run_sim(Verilator, 约 5 分钟)
-#   make clear      跑 clear 内核并校验帧缓冲
-#   make gouraud    跑 gouraud 内核并逐顶点校验
-#   make matmul     跑 matmul 内核并逐元素校验
-#   make anim       逐帧跑 anim 并逐帧对拍(4 帧)
-#   make check      依次跑 clear / gouraud / matmul / anim
-#   make demo       anim 动画 demo: SDL 窗口逐帧连续显示(需 SDL2; 关窗/ESC 结束)
-#   make demo-headless  anim demo 不显示窗口, 只逐帧对拍(默认 60 帧)
-#   make images     用 sw/ 的汇编器重新生成内核镜像(build/*.bin)
-#   make clean      清掉产物
-
-ROOT    := $(abspath ../..)
-BUILD   := build
+ROOT      := $(abspath ../..)
+BUILD     := build
 VERILATOR := $(ROOT)/tb/.tools/pytools/verilator/bin/verilator
-CXX     ?= g++
-CXXFLAGS ?= -O3 -std=c++17
-VERILATOR_FLAGS := -O3 -Wno-fatal --threads 2 --build-jobs 4 \
-                   --x-assign fast --x-initial fast
+CXX       ?= g++
+CXXFLAGS  ?= -O3 -std=c++17
+DEFS      :=
+VERILATOR_FLAGS := -O3 -Wno-fatal --threads 2 --build-jobs 4 --x-assign fast --x-initial fast
 
-# SDL2 窗口(可选): 有就打开 --view, 没有也能编译(运行时提示装 libsdl2-dev)
+# 波形支持: TRACE=fst(默认, --fst 可用) / TRACE=vcd(用 --vcd) / TRACE=off(不编)
+TRACE ?= fst
+ifeq ($(TRACE),fst)
+  LZ4_DEV := $(firstword $(wildcard /usr/include/lz4.h /usr/local/include/lz4.h))
+  ifeq ($(LZ4_DEV),)
+    $(info [run-sim] 没找到 <lz4.h>: 退回 VCD 波形(装 liblz4-dev 可启用 FST), 用 --vcd 导出)
+    TRACE := vcd
+  endif
+endif
+ifeq ($(TRACE),fst)
+  VERILATOR_FLAGS += --trace-fst
+  DEFS            += -DRUNSIM_FST
+else ifeq ($(TRACE),vcd)
+  VERILATOR_FLAGS += --trace
+  DEFS            += -DRUNSIM_VCD
+endif
+
+# SDL2 窗口(可选): 有就支持 --view, 没有也能编译(运行时提示装 libsdl2-dev)
 SDL_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
 SDL_LIBS   := $(shell pkg-config --libs sdl2 2>/dev/null)
 ifneq ($(strip $(SDL_LIBS)),)
-  CXXFLAGS += -DRUNSIM_HAVE_SDL $(SDL_CFLAGS)
-  LDFLAGS  += $(SDL_LIBS)
+  DEFS    += -DRUNSIM_HAVE_SDL $(SDL_CFLAGS)
+  LDFLAGS += $(SDL_LIBS)
 else
   $(info [run-sim] 未找到 SDL2(pkg-config sdl2): --view 不可用, 其余功能正常)
 endif
@@ -34,7 +38,6 @@ RTL_INC := -I$(ROOT)/hw/rtl -I$(ROOT)/hw/rtl/core -I$(ROOT)/hw/rtl/mem \
 
 SRCS := \
   $(ROOT)/hw/rtl/core/core_pkg.sv \
-  $(ROOT)/hw/rtl/mem/axi4_bus.sv \
   $(ROOT)/hw/rtl/core/alu.sv $(ROOT)/hw/rtl/core/mdu.sv \
   $(ROOT)/hw/rtl/core/exu.sv $(ROOT)/hw/rtl/core/fetch.sv \
   $(ROOT)/hw/rtl/core/simt_stack.sv $(ROOT)/hw/rtl/core/decode.sv \
@@ -58,7 +61,20 @@ SRCS := \
 OBJ_DIR := $(BUILD)/obj_dir
 BIN     := $(BUILD)/run_sim
 
-.PHONY: all run clear gouraud matmul anim check demo demo-headless clean images
+# 别名的默认参数(只有别名用得到; make run 完全走 ARGS)
+WARPS  ?= 4
+W      ?= 32
+H      ?= 32
+BOX    ?= 6
+SCALE  ?= 8
+FPS    ?= 30
+FRAMES ?=
+ARGS   ?=
+
+# 运行入口: 不 cd(镜像由测试台自己按名字找), 参数原样透传
+RUN := $(abspath $(BIN))
+
+.PHONY: all run lint clear gouraud matmul anim check demo demo-headless clean images
 
 all: $(BIN)
 
@@ -68,44 +84,46 @@ $(BIN): rtl/gpu_system.sv tb_main.cpp $(SRCS)
 	    --top-module gpu_system $(RTL_INC) \
 	    --Mdir $(OBJ_DIR) -o $(abspath $(BIN)) \
 	    $(SRCS) tb_main.cpp \
-	    -CFLAGS "$(CXXFLAGS)" -LDFLAGS "$(LDFLAGS)"
+	    -CFLAGS "$(CXXFLAGS) $(DEFS)" -LDFLAGS "$(LDFLAGS)"
 
-# 内核镜像由 sw/ 的汇编器生成(sim/simulator 的 make images 会产出 build/*.bin)
+lint:
+	$(VERILATOR) --lint-only -Wall --top-module gpu_system $(RTL_INC) $(SRCS)
+
 images:
 	$(MAKE) -C $(ROOT)/sim/simulator images
 
-run: clear
+run: $(BIN)
+	$(RUN) $(ARGS)
 
+# 便捷别名
 clear: $(BIN)
-	cd $(ROOT)/sim/simulator && $(abspath $(BIN)) --image build/clear.bin --warps 4 \
-	    --params 64,0x0000ff00,32 --fb-count 8 --fb-expect 0x0000ff00
+	$(RUN) --image clear --warps $(WARPS) $(ARGS)
 
 gouraud: $(BIN)
-	cd $(ROOT)/sim/simulator && $(abspath $(BIN)) --image build/gouraud.bin --kernel gouraud --warps 4
+	$(RUN) --image gouraud --warps $(WARPS) $(ARGS)
 
 matmul: $(BIN)
-	cd $(ROOT)/sim/simulator && $(abspath $(BIN)) --image build/matmul.bin --kernel matmul --warps 4
+	$(RUN) --image matmul --warps $(WARPS) $(ARGS)
 
 anim: $(BIN)
-	cd $(ROOT)/sim/simulator && $(abspath $(BIN)) --image build/anim.bin --kernel anim \
-	    --warps 4 --w 64 --h 64 --frames 4
-
-check: clear gouraud matmul anim
+	$(RUN) --image anim --warps $(WARPS) --w $(W) --h $(H) \
+	    --box $(BOX) $(if $(FRAMES),--frames $(FRAMES),--frames 4) $(ARGS)
 
 # 动画 demo: SDL 窗口逐帧重算画面(关窗或按 ESC 结束)
-# 画布用 32×32: RTL 仿真约 2 万拍/秒, 一帧 64×64 要 ~6.5 万拍(3 秒), 32×32 约 1.8 万拍
-DEMO_W ?= 32
-DEMO_H ?= 32
-DEMO_SCALE ?= 8
 demo: $(BIN)
-	cd $(ROOT)/sim/simulator && $(abspath $(BIN)) --image build/anim.bin --kernel anim \
-	    --warps 4 --view --w $(DEMO_W) --h $(DEMO_H) --box 6 --scale $(DEMO_SCALE) --fps 30
+	$(RUN) --image anim --warps $(WARPS) --w $(W) --h $(H) \
+	    --box $(BOX) --scale $(SCALE) --fps $(FPS) --view $(if $(FRAMES),--frames $(FRAMES)) $(ARGS)
 
-# 无窗口版本: 逐帧跑并逐帧与参考模型对拍
-FRAMES ?= 60
+# 无窗口版本: 逐帧跑并与参考模型对拍
 demo-headless: $(BIN)
-	cd $(ROOT)/sim/simulator && $(abspath $(BIN)) --image build/anim.bin --kernel anim \
-	    --warps 4 --w 64 --h 64 --frames $(FRAMES)
+	$(RUN) --image anim --warps $(WARPS) --w $(W) --h $(H) \
+	    --box $(BOX) $(if $(FRAMES),--frames $(FRAMES),--frames 60) $(ARGS)
+
+check:
+	$(MAKE) clear
+	$(MAKE) gouraud
+	$(MAKE) matmul
+	$(MAKE) anim
 
 clean:
 	rm -rf $(BUILD)

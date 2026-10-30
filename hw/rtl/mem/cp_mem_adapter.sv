@@ -1,7 +1,7 @@
 `include "defines.vh"
 
 // ============================================================================
-//  cp_mem_adapter —— CP 的行/字访存协议 → AXI4 主口(SPEC §3.1/§3.4)
+//  cp_mem_adapter —— CP 的行/字访存协议 → AXI4 主口
 //
 //  CP 的内存口是"请求 → ack → rsp"的两段式:
 //    读: mem_rd_req + mem_rd_addr + mem_rd_line(1 = 64B 行, 0 = 4B 字)
@@ -70,16 +70,17 @@ module cp_mem_adapter #(
         A_IDLE, A_RD_AR, A_RD_BEAT, A_RD_LAT, A_RD_RSP, A_WR_AW, A_WR_B
     } astate_t;
 
-    astate_t     st;
-    logic [ADDR_W-1:0] addr_q;
-    logic              is_line_q;
-    logic [DATA_W/8-1:0]  strb_q;
-    logic [DATA_W-1:0]    wdata_q;
+    astate_t state;
+    logic [  ADDR_W-1:0] addr_q;
+    logic                is_line_q;
+    logic [DATA_W/8-1:0] strb_q;
+    logic [  DATA_W-1:0] wdata_q;
     logic [4:0]        beat_q;        // 0..15 行内拍号(全局计数)
     logic              seg2_q;        // 1 = 正在取 64B 行的后 32B
-    logic [3:0]        err_q;
+    logic [ 3:0]       err_q;
     logic [31:0]       rbuf_q [0:LINE_WORDS-1];
 
+    // handshake
     wire rd_hs = m_arvalid && m_arready;
     wire r_hs  = m_rvalid && m_rready;
     wire aw_hs = m_awvalid && m_awready;
@@ -91,28 +92,28 @@ module cp_mem_adapter #(
     assign seg_addr = is_line_q ? ({addr_q[ADDR_W-1:6], 6'b0} + (seg2_q ? ADDR_W'(32) : ADDR_W'(0)))
                                 : addr_q;
 
-    assign m_arvalid = (st == A_RD_AR);
+    assign m_arvalid = (state == A_RD_AR);
     assign m_araddr  = seg_addr;
     assign m_arlen   = is_line_q ? 8'd7 : 8'd0;
     assign m_arsize  = 3'b010;          // 4 字节
     assign m_arburst = 2'b01;           // INCR
-    assign m_rready  = (st == A_RD_BEAT);
+    assign m_rready  = (state == A_RD_BEAT);
 
-    assign m_awvalid = (st == A_WR_AW);
+    assign m_awvalid = (state == A_WR_AW);
     assign m_awaddr  = addr_q & ~ADDR_W'(3);   // 字对齐
     assign m_awlen   = 8'd0;
     assign m_awsize  = 3'b010;
     assign m_awburst = 2'b01;
-    assign m_wvalid  = (st == A_WR_B);
+    assign m_wvalid  = (state == A_WR_B);
     assign m_wdata   = wdata_q;
     assign m_wstrb   = strb_q;
     assign m_wlast   = 1'b1;
-    assign m_bready  = (st == A_WR_B);
+    assign m_bready  = (state == A_WR_B);
 
     // 读数据锁存: 行访问按拍号落到 rbuf
     always_ff @(posedge clk) begin
         if (rst) begin
-            st         <= A_IDLE;
+            state      <= A_IDLE;
             addr_q     <= '0;
             is_line_q  <= 1'b0;
             beat_q     <= '0;
@@ -135,7 +136,7 @@ module cp_mem_adapter #(
             wr_rsp <= 1'b0;
             wr_err <= 1'b0;
 
-            case (st)
+            case (state)
                 A_IDLE: begin
                     beat_q <= '0;
                     seg2_q <= 1'b0;
@@ -144,18 +145,18 @@ module cp_mem_adapter #(
                         addr_q    <= rd_addr;
                         is_line_q <= rd_line;
                         rd_ack    <= 1'b1;       // 先 ack, 再去总线取数
-                        st        <= A_RD_AR;
+                        state     <= A_RD_AR;
                     end else if (wr_req) begin
                         addr_q  <= wr_addr;
                         wdata_q <= wr_data;
                         strb_q  <= wr_strb;
                         wr_ack  <= 1'b1;
-                        st      <= A_WR_AW;
+                        state   <= A_WR_AW;
                     end
                 end
 
                 A_RD_AR: begin
-                    if (rd_hs) st <= A_RD_BEAT;
+                    if (rd_hs) state <= A_RD_BEAT;
                 end
 
                 A_RD_BEAT: begin
@@ -167,10 +168,10 @@ module cp_mem_adapter #(
                                 // 第一段 8 拍结束, 接着取后 32B
                                 beat_q <= 5'd8;
                                 seg2_q <= 1'b1;
-                                st     <= A_RD_AR;
+                                state  <= A_RD_AR;
                             end else begin
                                 beat_q <= beat_q + 5'd1;
-                                st     <= A_RD_LAT;
+                                state  <= A_RD_LAT;
                             end
                         end else begin
                             beat_q <= beat_q + 5'd1;
@@ -180,32 +181,32 @@ module cp_mem_adapter #(
 
                 A_RD_LAT: begin
                     for (int i = 0; i < LINE_WORDS; i = i + 1) rd_data[i*32 +: 32] <= rbuf_q[i];
-                    st <= A_RD_RSP;
+                    state <= A_RD_RSP;
                 end
 
                 A_RD_RSP: begin
                     rd_err <= |err_q;
                     rd_rsp <= 1'b1;          // 数据已在上一拍锁进 rd_data
-                    st     <= A_IDLE;
+                    state  <= A_IDLE;
                 end
 
                 A_WR_AW: begin
-                    if (aw_hs) st <= A_WR_B;
+                    if (aw_hs) state <= A_WR_B;
                 end
 
                 A_WR_B: begin
                     if (w_hs && b_hs) begin
                         wr_rsp <= 1'b1;
                         wr_err <= (m_bresp != 2'b00);
-                        st     <= A_IDLE;
+                        state  <= A_IDLE;
                     end else if (b_hs) begin
                         wr_rsp <= 1'b1;
                         wr_err <= (m_bresp != 2'b00);
-                        st     <= A_IDLE;
+                        state  <= A_IDLE;
                     end
                 end
 
-                default: st <= A_IDLE;
+                default: state <= A_IDLE;
             endcase
         end
     end

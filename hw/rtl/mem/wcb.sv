@@ -5,8 +5,7 @@
 //
 //  每个 SM 一份,8 项 × 32B 行。全局 store 先进这里按行合并,满足以下条件才写出去
 //  (`out_*` 端口交给 `global_mem` 发 AXI 写):
-//    · 缓冲区满(第 9 项要进来)—— 由上层先 `flush_req`;
-//    · `exit` / `bar.sync` 要求可见 —— 上层拉 `flush_req`。
+//    · 下游空闲就交出去(本模块不做背压闸门);`empty`/`full` 供上层观察。
 //
 //  **读旁路(D2)**:`ld.g` 先查这里 ——
 //    · 整行命中(请求的字都被写过)⇒ `rd_hit`,直接返回,不碰 AXI;
@@ -37,9 +36,7 @@ module wcb #(
     input  wire [26:0]             mg_line     ,
     input  wire [WORDS-1:0][31:0]  mg_data_in  ,
     output logic [WORDS-1:0][31:0] mg_data_out ,
-    // ---- 冲刷 ----
-    input  wire                    flush_req   ,   // 电平: 冲刷到空为止
-    output logic                   flush_done  ,   // 脉冲: 本次冲刷完成
+    // ---- 缓冲状态 ----
     output logic                   empty       ,
     output logic                   full        ,   // 缓冲已满(需要腾位置)
     // ---- 写出口(每次一项,交给 global_mem) ----
@@ -150,9 +147,7 @@ module wcb #(
                 dat_mem[i]  <= '0;
             end
             cnt        <= '0;
-            flush_done <= 1'b0;
         end else begin
-            flush_done <= 1'b0;
 
             // 写合并(命中 ⇒ 就地更新;未命中 ⇒ 占一个空项)
             if (wr_valid && wr_ready) begin
@@ -181,11 +176,6 @@ module wcb #(
             cnt <= cnt + (do_alloc ? {{IDX_W{1'b0}}, 1'b1} : '0) -
                          (do_remove ? {{IDX_W{1'b0}}, 1'b1} : '0);
 
-            // 冲刷完成:本拍之后缓冲为空且上层仍要求冲刷
-            if (flush_req &&
-                (cnt + (do_alloc ? {{IDX_W{1'b0}}, 1'b1} : '0) -
-                       (do_remove ? {{IDX_W{1'b0}}, 1'b1} : '0)) == '0)
-                flush_done <= 1'b1;
         end
     end
 

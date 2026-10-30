@@ -154,7 +154,7 @@ module lsu #(
     //  FSM
     // ======================================================================
     typedef enum logic [2:0] {
-        L_IDLE, L_SMEM, L_GM_NEXT, L_GM_REQ, L_GM_WAIT, L_DONE
+        L_IDLE, L_SMEM, L_GM_REQ, L_GM_WAIT, L_DONE
     } lsu_state_t;
 
     lsu_state_t st;

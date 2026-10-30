@@ -12,19 +12,19 @@ module cp_regs import cp_pkg::*; #(
 
     // 外部(AXI4-Lite 侧)访问 
     input  wire         ext_wr           ,
-    input  wire [11:0]  ext_addr         ,
-    input  wire [31:0]  ext_wdata        ,
+    input  wire  [11:0] ext_addr         ,
+    input  wire  [31:0] ext_wdata        ,
     input  wire         ext_rd           ,   // 读请求
     output logic [31:0] ext_rdata        ,
-    input  wire [11:0]  chk_addr         ,   // WRITE_REG 命令的目标地址
+    input  wire  [11:0] chk_addr         ,   // WRITE_REG 命令的目标地址
     output logic        chk_wr_ok        ,   // 该地址可否被写
-    // 内部读口(READ_REG 命令读 MMIO 寄存器)
-    input  wire [11:0]  int_addr         ,
+    // 内部读口
+    input  wire  [11:0] int_addr         ,
     output logic [31:0] int_rdata        ,
-    // 内部写口(WRITE_REG 命令写 MMIO 寄存器)
+    // 内部写口
     input  wire         int_wr           ,
-    input  wire [11:0]  int_wr_addr      ,
-    input  wire [31:0]  int_wr_wdata     ,
+    input  wire  [11:0] int_wr_addr      ,
+    input  wire  [31:0] int_wr_wdata     ,
     output logic        cp_reset_evt     ,   // 本拍 host 写了 CP_RESET
     output logic        doorbell_evt     ,   // 本拍 host 写了 DOORBELL
 
@@ -33,17 +33,17 @@ module cp_regs import cp_pkg::*; #(
     input  wire         idle_i           ,   // 队列空 && 无在跑命令 && 无错误(CP_STATUS.IDLE)
 
     // SM / 引擎的现场
-    input  wire [1:0]   sm_done_i        ,
-    input  wire [3:0]   sm0_error_i      ,
-    input  wire [3:0]   sm1_error_i      ,
-    input  wire [31:0]  sm0_fault_pc_i   ,
-    input  wire [31:0]  sm1_fault_pc_i   ,
-    input  wire [2:0]   gemm_status_i    ,
-    input  wire [7:0]   gemm_error_i     ,
-    input  wire [2:0]   twod_status_i    ,
-    input  wire [7:0]   twod_error_i     ,
-    output logic [1:0]  sm_err_clr       ,   // {sm1, sm0}
-    output logic [1:0]  eng_err_clr      ,   // {gemm, 2d}
+    input  wire  [ 1:0] sm_done_i        ,
+    input  wire  [ 3:0] sm0_error_i      ,
+    input  wire  [ 3:0] sm1_error_i      ,
+    input  wire  [31:0] sm0_fault_pc_i   ,
+    input  wire  [31:0] sm1_fault_pc_i   ,
+    input  wire  [ 2:0] gemm_status_i    ,
+    input  wire  [ 7:0] gemm_error_i     ,
+    input  wire  [ 2:0] twod_status_i    ,
+    input  wire  [ 7:0] twod_error_i     ,
+    output logic [ 1:0] sm_err_clr       ,   // {sm1, sm0}
+    output logic [ 1:0] eng_err_clr      ,   // {gemm, 2d}
 
     // 内部端口:配置寄存器(CP 状态机读)
     output logic [31:0] head_o           ,
@@ -52,13 +52,13 @@ module cp_regs import cp_pkg::*; #(
     output logic [31:0] queue_size_o     ,
     output logic [31:0] sem_base_o       ,
     output logic [31:0] timeout_o        ,
-    output logic [1:0]  kernel_mask_o    ,
+    output logic [ 1:0] kernel_mask_o    ,
     output logic [31:0] img_entry_o [0:1],
     output logic [31:0] img_size_o  [0:1],
     output logic [31:0] img_flags_o [0:1],
-    output logic [3:0]  cp_error_o       ,
-    output logic [7:0]  irq_status_o     ,
-    output logic [7:0]  irq_enable_o     ,
+    output logic [ 3:0] cp_error_o       ,
+    output logic [ 7:0] irq_status_o     ,
+    output logic [ 7:0] irq_enable_o     ,
     output logic        doorbell_pend_o  ,
 
     // 状态机写
@@ -105,9 +105,7 @@ module cp_regs import cp_pkg::*; #(
     // irq = IRQ_STATUS & IRQ_ENABLE
     assign irq_o = |(irq_status & irq_enable);
 
-    // 哪些偏移可以被 `WRITE_REG` 命令写(§6.2)。**`CMD_HEAD` 不在表内**:它只有 host 直写这一条合法路径
-    // (`head` 是 CP 自己的读取指针,命令流改它等于让 CP 跳过/重读命令;需要"丢弃未处理命令"请用 `CP_RESET`)。
-    // 写成可写但实际不动(`head` 的赋值只看外部口)会变成"接受了却无声无效",比报错更难查。
+    // 哪些偏移可以被 `WRITE_REG` 命令写
     always_comb begin
         case (chk_addr)
             {4'h0, `MMIO_CP_ERROR      }, {4'h0, `MMIO_CMD_TAIL  }, {4'h0, `MMIO_DOORBELL},
@@ -156,8 +154,8 @@ module cp_regs import cp_pkg::*; #(
 
     // 外部写的合法性
     wire que_cfg_wr = (ext_addr == {4'h0, `MMIO_CMD_QUEUE_BASE}) || (ext_addr == {4'h0, `MMIO_CMD_QUEUE_SIZE});
-    wire ext_wr_now = ext_wr & (que_cfg_wr ? idle_i : 1'b1);
-    wire wr_now     = int_wr | ext_wr_now;               // 内部(命令)优先
+    wire ext_wr_en  = ext_wr & (que_cfg_wr ? idle_i : 1'b1);
+    wire wr_en      = int_wr | ext_wr_en;               // 内部(命令)优先
     wire [11:0] wr_addr = int_wr ? int_wr_addr : ext_addr;
     wire [31:0] wr_data = int_wr ? int_wr_wdata: ext_wdata;
 
@@ -184,7 +182,7 @@ module cp_regs import cp_pkg::*; #(
         else begin
             // 内部写(状态机)优先级高于外部写
             if (head_we) head <= head_wdata;
-            else if (ext_wr_now && ext_addr == {4'h0, `MMIO_CMD_HEAD}) begin
+            else if (ext_wr_en && ext_addr == {4'h0, `MMIO_CMD_HEAD}) begin
                 // 只接受队列范围内的值, 越界丢弃
                 if (ext_wdata >= queue_base && ext_wdata < queue_base + queue_size &&
                     ext_wdata[1:0] == 2'b00)
@@ -213,7 +211,7 @@ module cp_regs import cp_pkg::*; #(
             end
 
             // 外部/内部(命令)写
-            if (wr_now) begin
+            if (wr_en) begin
                 case (wr_addr)
                     {4'h0, `MMIO_CP_ERROR}:    cp_error    <= CPERR_NONE;          // 写任意值清零
                     {4'h0, `MMIO_IRQ_STATUS}:  irq_status  <= 8'h0;                // 写任意值清零
@@ -252,13 +250,13 @@ module cp_regs import cp_pkg::*; #(
         end
     end
 
-    assign cp_reset_evt = ext_wr_now & (ext_addr == {4'h0, `MMIO_CP_RESET}) & (ext_wdata[0]);
-    assign doorbell_evt = ext_wr_now & (ext_addr == {4'h0, `MMIO_DOORBELL});
+    assign cp_reset_evt = ext_wr_en & (ext_addr == {4'h0, `MMIO_CP_RESET}) & (ext_wdata[0]);
+    assign doorbell_evt = ext_wr_en & (ext_addr == {4'h0, `MMIO_DOORBELL});
 
     // 清零扇出到拥有者(SM / 引擎)
-    assign sm_err_clr  = {ext_wr_now & (ext_addr == {4'h0, `MMIO_SM1_ERROR}),
-                          ext_wr_now & (ext_addr == {4'h0, `MMIO_SM0_ERROR})};
-    assign eng_err_clr = {ext_wr_now & (ext_addr == {4'h0, `MMIO_GEMM_ERROR}),
-                          ext_wr_now & (ext_addr == {4'h0, `MMIO_2D_ERROR})};
+    assign sm_err_clr  = {ext_wr_en & (ext_addr == {4'h0, `MMIO_SM1_ERROR}),
+                          ext_wr_en & (ext_addr == {4'h0, `MMIO_SM0_ERROR})};
+    assign eng_err_clr = {ext_wr_en & (ext_addr == {4'h0, `MMIO_GEMM_ERROR}),
+                          ext_wr_en & (ext_addr == {4'h0, `MMIO_2D_ERROR})};
 
 endmodule

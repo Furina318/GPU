@@ -1,5 +1,4 @@
 `include "defines.vh"
-import core_pkg::*;
 
 // ============================================================================
 //  core —— 一个 SM(Streaming Multiprocessor)
@@ -12,7 +11,7 @@ import core_pkg::*;
 //    · exit: warp 停用; 所有 warp 退出 ⇒ done。
 // ============================================================================
 
-module core #(
+module core import core_pkg::*; #(
     parameter int WARPS = `WARPS_PER_SM,
     parameter int LANES = `WARP_SIZE
 ) (
@@ -22,7 +21,8 @@ module core #(
     // ---- CP: LAUNCH(单拍脉冲) ----
     input  wire                    launch         ,
     input  wire [31:0]             launch_pc      ,
-    input  wire [3:0]              launch_warps   ,   // 1..4
+    input  wire [3:0]              launch_warps   ,   // 1..WARPS(本配置 1..4)
+    input  wire [2:0]              warp_base      ,   // 本 SM 的 warp id 起始(SM0=0, SM1=WARPS)
     /* verilator lint_off UNUSEDSIGNAL */
     input  wire [3:0]              launch_flags   ,   // 只影响 CP 的准入检查, SM 侧不解释
     /* verilator lint_on UNUSEDSIGNAL */
@@ -59,6 +59,10 @@ module core #(
     input  wire                    flush_done     ,
     output logic                   mem_busy
 );
+
+    // warp 索引的位宽(4 warp ⇒ 2 位)。整套逻辑都按 `WARPS` 参数化, 想改成
+    // 每 SM 8 个 warp 只需要调 `WARPS_PER_SM`, 这些索引跟着自动变宽。
+    localparam int WARPS_W = (WARPS > 1) ? $clog2(WARPS) : 1;
 
     // ======================================================================
     //  共享资源: 指令 SRAM / 共享内存 / 调度器
@@ -180,6 +184,9 @@ module core #(
     logic [WARPS-1:0] warp_run;
     logic [WARPS-1:0] warp_exit;
     logic [WARPS-1:0] warp_bar;
+    logic [WARPS-1:0] warp_done;        // 每 warp 已退休(等下一次 launch)
+    logic [WARPS-1:0] warp_retire;      // 每 warp 的"可以退休"脉冲
+    logic             exit_retire_ok;
     logic [WARPS-1:0] warp_err_pulse;
     logic [3:0]       warp_err_code [WARPS];
     logic [31:0]      warp_err_pc  [WARPS];
@@ -195,27 +202,32 @@ module core #(
     logic [WARPS-1:0]        f_ready, f_rsp;
     logic [31:0]             f_result;
     logic                    fpu_any, fpu_rdy, fpu_out;
-    logic [1:0]              fpu_sel, fpu_ptr;
+    logic [WARPS_W-1:0]      fpu_sel, fpu_ptr;
+    /* verilator lint_off UNUSEDSIGNAL */
+    // fpu 的 ID_WIDTH = 5(见 fpu.v), SM 侧只有 4 个 warp, 高 3 位不参与路由
     logic [4:0]              fpu_id_o;
+    /* verilator lint_on UNUSEDSIGNAL */
     logic [4:0]              fpu_fflags_unused;
 
-    always_comb begin : fpu_arb
-        integer k, idx;
-        fpu_sel = '0;
-        fpu_any = 1'b0;
-        idx     = 0;
-        for (k = 0; k < WARPS; k = k + 1) begin
-            idx = (k + int'(fpu_ptr)) % WARPS;
-            if (!fpu_any && f_req[idx]) begin
-                fpu_any = 1'b1;
-                fpu_sel = idx[1:0];
-            end
+    // 共享端口的轮转仲裁: 从 ptr 之后开始, 找第一个请求者。
+    // 取指口与 FPU 口共用这一段 —— 两处原本各写一份循环, 只差一个起始偏移。
+    function automatic logic [WARPS_W-1:0] rr_pick(input logic [WARPS-1:0] req,
+                                                   input logic [WARPS_W-1:0] ptr);
+        integer k;
+        logic [WARPS_W-1:0] idx;
+        rr_pick = '0;
+        for (k = WARPS - 1; k >= 0; k = k - 1) begin
+            idx = WARPS_W'((int'(ptr) + 1 + k) % WARPS);
+            if (req[idx]) rr_pick = idx;   // 越靠近 ptr+1 的越晚写, 最终胜出
         end
-    end
+    endfunction
+
+    assign fpu_any = |f_req;
+    assign fpu_sel = rr_pick(f_req, fpu_ptr);
 
     always_ff @(posedge clk) begin
         if (rst) fpu_ptr <= '0;
-        else if (fpu_any && fpu_rdy) fpu_ptr <= fpu_sel + 2'd1;
+        else if (fpu_any && fpu_rdy) fpu_ptr <= fpu_sel + WARPS_W'(1);
     end
 
     fpu #(.ID_WIDTH(5)) u_fpu (
@@ -230,7 +242,7 @@ module core #(
         .src3      (f_src3[fpu_sel]),
         .flush     (1'b0),
         .flush_id  (5'd0),
-        .fpu_id    ({3'b000, fpu_sel}),
+        .fpu_id    ({{(5-WARPS_W){1'b0}}, fpu_sel}),
         .fpu_valid (fpu_out),
         .fpu_id_o  (fpu_id_o),
         .fpu_result(f_result),
@@ -242,28 +254,15 @@ module core #(
     /* verilator lint_on UNUSEDSIGNAL */
 
     // ---- 取指口仲裁(4 抢 1) ----
-    logic [1:0] imem_owner, imem_owner_q;
+    logic [WARPS_W-1:0] imem_owner, imem_owner_q;
     logic       imem_busy_q;
     logic [WARPS-1:0] f_imem_req_valid;
     logic [WARPS-1:0][31:0] f_imem_req_pc;
 
-    always_comb begin : imem_arb
-        integer k, idx;
-        imem_fetch_en = 1'b0;
-        imem_owner    = '0;
-        idx           = 0;
-        // 轮转: 从上一个被服务者之后开始找 —— 否则 0 号 warp 会一直以
-        // "最小号"赢得仲裁, 其余 warp 永久饥饿(4 warp 用例死锁的根因)。
-        if (!imem_busy_q) begin
-            for (k = 0; k < WARPS; k = k + 1) begin
-                idx = (int'(imem_owner_q) + 1 + k) % WARPS;
-                if (f_imem_req_valid[idx] && !imem_fetch_en) begin
-                    imem_fetch_en = 1'b1;
-                    imem_owner    = idx[1:0];
-                end
-            end
-        end
-    end
+    // 轮转: 从上一个被服务者之后开始找 —— 否则 0 号 warp 会一直以
+    // "最小号"赢得仲裁, 其余 warp 永久饥饿(多 warp 用例死锁的根因)。
+    assign imem_fetch_en = !imem_busy_q && (|f_imem_req_valid);
+    assign imem_owner    = rr_pick(f_imem_req_valid, imem_owner_q);
     assign imem_fetch_addr = f_imem_req_pc[imem_owner][`CLOG_INSTR+1:2];
 
     // 取指数据下一拍有效: 记住这一拍是谁发的
@@ -308,7 +307,9 @@ module core #(
 
             logic [31:0]            latch_pc, latch_inst;
             logic                   dec_in_v;
-            core_pkg::handshake     dec_out;
+            /* verilator lint_off UNUSEDSIGNAL */
+            core_pkg::handshake     dec_out;    // 只取 .valid(ready 恒 1, decode 每拍都能收)
+            /* verilator lint_on UNUSEDSIGNAL */
             dec_info_t              dec_info, dec_lat;
             /* verilator lint_off UNUSEDSIGNAL */
             logic                   dec_lat_vld;
@@ -354,7 +355,8 @@ module core #(
             logic [2:0] wst;
             localparam logic [2:0]
                 W_IDLE = 3'd0, W_DEC = 3'd2,
-                W_EXEC = 3'd3, W_BAR = 3'd4, W_EXIT = 3'd5;
+                W_EXEC = 3'd3, W_BAR = 3'd4, W_EXIT = 3'd5,
+                W_RETIRED = 3'd6;              // 已退休(等下一次 launch)
 
             // ---------------- fetch ----------------
             fetch u_fetch (
@@ -427,9 +429,8 @@ module core #(
                 assign wb_gpr_data_u[gi] = wb_gpr_data[gi];
             end
 
+            // wbu 是纯组合的写回成形单元(把"指令谓词 + lane 掩码"落到每 lane 的写使能)
             wbu u_wbu (
-                .clk             (clk),
-                .rst             (rst),
                 .valid           (wb_valid),
                 .effective_mask  (wb_eff_mask),
                 .gpr_wr_en_in    (wb_gpr_we),
@@ -451,7 +452,6 @@ module core #(
             for (li = 0; li < LANES; li = li + 1) begin : g_lane
                 regfile u_rf (
                     .clk          (clk),
-                    .rst          (rst),
                     .valid        (1'b1),
                     .gpr_wr_addr  (wb_gpr_addr_l[li]),
                     .gpr_wr_en    (wb_gpr_en_l[li]),
@@ -471,15 +471,15 @@ module core #(
             end
 
             // FPU 的发起许可与结果路由(每个 warp 一份)
-            assign f_ready[W] = fpu_any && fpu_rdy && (fpu_sel == W[1:0]);
-            assign f_rsp[W]   = fpu_out && (fpu_id_o[1:0] == W[1:0]);
+            assign f_ready[W] = fpu_any && fpu_rdy && (fpu_sel == WARPS_W'(W));
+            assign f_rsp[W]   = fpu_out && (fpu_id_o[WARPS_W-1:0] == WARPS_W'(W));
 
             // ---------------- exu ----------------
             exu #(.LANES(LANES)) u_exu (
                 .clk            (clk),
                 .rst            (rst),
                 .warp_active    (warp_run[W]),
-                .warp_id        (W[1:0]),
+                .warp_id        (3'(W) + warp_base),
                 .dec            (dec_lat),
                 .eff_mask       (mask_lat),
                 .rs1_data       (rs1_d),
@@ -605,21 +605,26 @@ module core #(
                     ex_en         <= 1'b0;
                     warp_exit[W]  <= 1'b0;
                     warp_bar[W]   <= 1'b0;
+                    warp_done[W]  <= 1'b0;
                 end else begin
                     ex_en        <= 1'b0;
+                    // warp_exit / warp_bar 只由本 always_ff 驱动(全局块不再写它们,
+                    // 两个 always_ff 写同一位会被综合/仿真当成多驱动)。
                     warp_exit[W] <= 1'b0;
 
                     if (launch) begin
                         // 新内核: 状态机回到取指。不写这一支的话, 上一轮停在 W_EXIT 的
                         // warp 会永远留在 W_EXIT —— 一个 SM 只能跑一次内核。
                         wst           <= W_IDLE;
+                        warp_bar[W]   <= 1'b0;
+                        warp_done[W]  <= 1'b0;
                         dec_lat_vld   <= 1'b0;
                         dec_in_v      <= 1'b0;
                         dec_lat       <= '0;
                         fet_out_ready <= 1'b0;
                         ex_en         <= 1'b0;
                     end else if (sm_halt) begin
-                        wst <= W_EXIT;
+                        if (!warp_done[W]) wst <= W_EXIT;
                     end else if (err_now) begin
                         // 取指侧的第一处错误(非法指令在 W_EXEC 里判)
                         warp_err_pulse[W] <= 1'b1;
@@ -676,11 +681,24 @@ module core #(
                                 end
                             end
                             W_BAR: begin
-                                if (!bar_hold && !bar_pending) wst <= W_IDLE;
+                                if (!bar_hold && !bar_pending) begin
+                                    wst         <= W_IDLE;
+                                    warp_bar[W] <= 1'b0;
+                                end
                             end
                             W_EXIT: begin
-                                warp_exit[W] <= 1'b1;
+                                // 出口冲刷排空后才退休(见 exit_retire_ok); 退休后停在
+                                // W_RETIRED 等下一次 launch —— 不能继续停在 W_EXIT, 否则会
+                                // 反复发起冲刷请求。
+                                if (exit_retire_ok) begin
+                                    warp_exit[W] <= 1'b0;
+                                    warp_done[W] <= 1'b1;
+                                    wst          <= W_RETIRED;
+                                end else begin
+                                    warp_exit[W] <= 1'b1;
+                                end
                             end
+                            W_RETIRED: begin end
                             default: wst <= W_IDLE;
                         endcase
                     end
@@ -718,6 +736,19 @@ module core #(
     // 有 warp 已经执行完 exit 但还没退休 ⇒ 先冲刷写缓冲
     assign exit_flush_req = (|warp_exit);
 
+    // 出口冲刷完成的单拍脉冲 ⇒ 放行退休。warp_retire 是每个 warp 的退休脉冲,
+    // 由"该 warp 在 W_EXIT 且冲刷已排空"组合得到(不再是第二个 always_ff 去写位图)。
+    logic exit_flush_done_p;
+    assign exit_flush_done_p = bar_pending && bar_flush_done;
+    assign exit_retire_ok    = exit_flush_done_p;
+
+    genvar gi_ret;
+    generate
+        for (gi_ret = 0; gi_ret < WARPS; gi_ret = gi_ret + 1) begin : g_retire
+            assign warp_retire[gi_ret] = warp_exit[gi_ret] && exit_retire_ok;
+        end
+    endgenerate
+
     // ======================================================================
     //  全局: 发射轮转 / 错误 / done / 停机
     // ======================================================================
@@ -734,26 +765,20 @@ module core #(
         end else begin
             sm_done <= 1'b0;
 
-            // 退休只在写缓冲排空后进行(见上面的 exit_flush_req)
-            if (!exit_flush_req || flush_done) begin
-                warp_run  <= warp_run & ~warp_exit;
-                warp_exit <= '0;
-            end
+            // 退休只在写缓冲排空后进行(见上面的 exit_flush_req): warp_retire 是单拍脉冲
+            warp_run <= warp_run & ~warp_retire;
 
             if (launch) begin
-                warp_run    <= (4'hF >> (4 - launch_warps));
+                warp_run    <= (WARPS'(1) << launch_warps) - WARPS'(1);
                 sm_error    <= 4'd0;
                 sm_fault_pc <= 32'h0;
                 sm_halt     <= 1'b0;
-                warp_bar    <= '0;
             end
 
             // 屏障到齐 / 退出 ⇒ 冲刷一次 WCB, 排空后放行
             if ((bar_flush_req || exit_flush_req) && !bar_pending) bar_pending <= 1'b1;
-            if (bar_pending && bar_flush_done) begin
-                bar_pending <= 1'b0;
-                warp_bar    <= '0;
-            end
+            // 屏障到齐 / 出口冲刷完成 ⇒ 放行(各 warp 的状态位由各自的 FSM 清)
+            if (bar_pending && bar_flush_done) bar_pending <= 1'b0;
 
             // 错误汇总(取第一处, 停机)
             for (int k = 0; k < WARPS; k = k + 1) begin

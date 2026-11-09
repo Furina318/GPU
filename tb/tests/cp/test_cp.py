@@ -34,8 +34,9 @@ class CpTb:
         # 输入先归零, 免得复位期间有悬空请求
         for name, val in (("s_awvalid", 0), ("s_wvalid", 0), ("s_bready", 1),
                           ("s_arvalid", 0), ("s_rready", 1),
-                          ("mem_rd_ack", 0), ("mem_rd_rsp", 0), ("mem_rd_data", 0),
-                          ("mem_rd_err", 0), ("mem_wr_ack", 0), ("mem_wr_rsp", 0),
+                          ("mem_rd_ack", 0), ("mem_rd_vld", 0), ("mem_rd_word", 0),
+                          ("mem_rd_last", 0), ("mem_rd_err", 0),
+                          ("mem_wr_ack", 0), ("mem_wr_rsp", 0),
                           ("mem_wr_err", 0), ("sm_done", 0), ("sm0_error", 0),
                           ("sm1_error", 0), ("sm0_fault_pc", 0), ("sm1_fault_pc", 0),
                           ("sram_load_done", 0), ("sram_err_ovf", 0),
@@ -470,8 +471,12 @@ async def test_sm_fault_does_not_signal(dut):
     await tb.q.submit(E.make_cmd(E.CMD_LAUNCH, [f["entry"], 4, f["flags"]], signal_id=2))
     await E.axil_write(dut, E.MMIO_CMD_TAIL, tb.q.tail)
     await tb.q.doorbell()
-    for _ in range(30):                                  # 等它真的跑起来
+    for _ in range(400):                                 # 等它真的分发出去再注入错误
         await FallingEdge(dut.clk)
+        if tb.sm.launches:
+            break
+    else:
+        raise AssertionError("LAUNCH 没有被分发到 SM")
     tb.sm.error0 = 3                                     # BAD_ALIGN
     code = 0
     for _ in range(400):

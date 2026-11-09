@@ -52,14 +52,14 @@ module lsu_coalescer #(
         for (rj = 0; rj < LANES; rj = rj + 1) begin
             min_line = 32'hFFFF_FFFF;
             found    = 1'b0;
-            // ① 在未服务的 lane 里取最小的行号 addr[31:5]
+            // 在未服务的 lane 里取最小的行号 addr[31:5]
             for (li = 0; li < LANES; li = li + 1) begin
                 if (lane_en[li] && !used[li] && (lane_addr[li][31:5] < min_line[31:5])) begin
                     min_line = {lane_addr[li][31:5], 5'b0};
                     found    = 1'b1;
                 end
             end
-            // ② 同行 lane 归成一组, 行内每个字按 addr[4:2] 置 wen
+            // 同行 lane 归成一组, 行内每个字按 addr[4:2] 置 wen
             if (found) begin
                 req_line[rj] = min_line;
                 for (li = 0; li < LANES; li = li + 1) begin

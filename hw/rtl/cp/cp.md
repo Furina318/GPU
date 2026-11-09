@@ -1,487 +1,836 @@
-# cp.md —— CP(命令处理器)调度器设计方案
+# CP —— 命令处理器(Command Processor)
 
-版本 0.2 · 关联文档:`CMDS.md`(**权威**,§2 队列/§2.4 校验表/§4 LAUNCH/§6 各命令/§7 MMIO/§8 错误/§9 状态机/§10 信号量)、`SPEC.md` §2/§3.1/§4、`ISA.md` §2.2/§2.5/§2.6/§8、`GFX.md` §3/§4/§7
-参考模型:`sim/simulator/include/cp.hpp` + `sim/simulator/src/cp.cpp`(golden)、`sim/simulator/src/main.cpp`(host 侧 MMIO)、`sw/demo/demo.hpp`(驱动契约)
-
-> **本文档回答什么**:CP 的**调度器**在 RTL 里长什么样 —— 模块怎么拆、状态机怎么走、
-> 变长命令怎么取、依赖/完成/超时怎么判、错误怎么停与怎么恢复、拿什么验收。
-> **不回答什么**:命令编码与 MMIO 偏移(权威在 `CMDS.md`)、SM 内部怎么执行
-> (`ISA.md`)、2D 引擎内部语义(`GFX.md`)。本文档只在"实现计划 + 信号级接口"这一层说话,
-> 与那三份冲突时以它们为准;两边不一致的地方列在 §12 与 §13,凡已回填到权威文档的会就地注明章节。
-
-**实现状态**:`hw/rtl/cp/` 已全部落地(`cp_pkg.sv` / `axil_slave.sv` / `cp_regs.sv` / `cmd_decode.sv` / `crc32_word.sv` / `cp.sv`),15 个 cocotb 用例覆盖正例与错误路径(`tb/tests/cp/test_cp.py`),`--werror` 下零 lint 警告。本文档与实现的差异只保留在 §13(与参考模型的三处取舍)。
+> 本文描述 **hw/rtl/cp 下真实存在的 RTL**。上一版文档是按"cp_fsm / cmd_fetch /
+> kernel_loader / sem_unit / launch_unit"这种拆分写的，与实际代码不符（实际只有一个
+> 大状态机 + 一个寄存器文件 + 一个小校验器 + 一个 CRC 单元）。这一版逐条对照源码，
+> 文中 `cp.sv:NNN` 之类的引用都可以直接跳过去看。
+>
+> 命令语义与 MMIO 偏移的权威定义仍以 `docs/CMDS.md` 为准；本文只负责回答"RTL 是
+> 怎么把它做出来的"。
 
 ---
 
-## 1. 职责边界
+## 1. CP 是什么
 
-CP 是**单点顺序执行器**,只做命令级调度(CMDS §1):
-
-| 做 | 不做 |
-|---|---|
-| 从命令环取命令、校验长度/保留位(§2.4)、按 `length_words` 跳过 | 不执行 shader 指令(那是 SM 的 warp scheduler) |
-| 把内核镜像从全局内存**流式**预加载进指令 SRAM,校验镜像头 + CRC(§6.4) | 不解释 2D 参数含义(只按长度校验后原样转交,GFX.md §4) |
-| 前置条件检查(LAUNCH 九条、GEMM 描述符、PARAMS 边界) | 不做乱序、不做抢占(CMDS §9 明确:in-order 是既定模型) |
-| 分发:SM / 2D / GEMM;维护 `SM_KERNEL_MASK`、`SM_DONE` 观测 | 不碰帧缓冲几何/顶点格式(那是 GFX.md 与 2D 引擎的事) |
-| 依赖与完成:信号量的读-改-写、`wait_id` 等待、完成判定(§10) | **不做 atomics** —— 信号量只由 CP 单点读改写(CMDS §10.2) |
-| 错误:首个错误保留、置 `CP_ERROR`/IRQ、停机(§8.3);超时兜底(§9) | 不"尽力而为":错误态停机,只能 host 写 `CP_RESET`(§7.3) |
-
-CP 与 SM 之间只有三件事:**分发(LAUNCH)/ 观测完成(`SM_DONE`、`SM_ERROR`)/ 观测现场(`SM*_FAULT_PC`)**(CMDS §1)。
-
----
-
-## 2. 调度模型(设计核心)
-
-一句话:**in-order、阻塞式、依赖只通过信号量表达**。
+整颗 GPU 只有一个启动入口：**CP**。SM 不会自己去取指，2D/GEMM 引擎不会自己去干活，
+它们都在等 CP 发放那个一拍的脉冲。
 
 ```
-命令流:  [NOP] [PARAMS] [LAUNCH] [FENCE] [2D_DRAW] [WAIT] ...
-             │        │          │        │         │
-  执行时长:  1 拍    流式写常量   阻塞到 SM 全 DONE   等到前面全部完成  阻塞到 SEM >= value
+        host(驱动)                        CP                        其它单元
+   ┌──────────────┐   AXI4-Lite   ┌────────────────┐   launch   ┌──────────┐
+   │ 写命令环      │ ────────────► │ 读命令环        │ ─────────► │ SM0/SM1  │
+   │ 敲 DOORBELL  │  (MMIO 4KB)   │ 校验 / 执行     │            └──────────┘
+   │ 读 CMD_HEAD  │ ◄──────────── │ 推进 HEAD       │   payload  ┌──────────┐
+   │ 等中断 / 信号量│               │ 加信号量 / 中断  │ ─────────► │ 2D/GEMM  │
+   └──────────────┘               └────────────────┘            └──────────┘
+                                        │ AXI4 主口(经 cp_mem_adapter)
+                                        ▼
+                                    全局内存(命令环/常量区/信号量/镜像)
 ```
 
-每条命令的**完成语义**分三类(这张表是调度器的骨架):
+### 1.1 它做什么
 
-| 类别 | 命令 | 什么时候算完成 | 占用多少拍(量级) |
-|---|---|---|---|
-| 立即完成 | NOP / WRITE_REG / READ_REG / SIGNAL / IRQ / PARAMS / FENCE | 做完就完了(READ_REG 要等 1 次 DMA 读、PARAMS 要等 N/16 次 64B 写) | 2 ~ 数十拍 |
-| 引擎完成 | LAUNCH / GEMM / 2D_* | 等 `SM_DONE` 齐 / 等引擎 `DONE && !BUSY && !ERROR` | 整个 kernel 的时间 |
-| 条件等待 | WAIT / 任何带 `wait_id` 的命令 | 等到条件满足(**不是**"等固定拍数") | 不确定 ⇒ 必须配超时 |
+| 类别 | 具体职责 |
+|------|----------|
+| 取指 | 从命令环（全局内存里的一段环形缓冲）按 HEAD 逐条取命令，一次一条 |
+| 校验 | 长度 / 保留位 / 对齐 / 地址窗口 / 各 opcode 的语义约束（`cmd_decode.sv`） |
+| 执行 | 自己动手：NOP/FENCE/READ_REG/WRITE_REG/SIGNAL/WAIT/IRQ/PARAMS；或是分发：LAUNCH / GEMM / 2D |
+| 装镜像 | `LOAD_KERNEL` 把 kernel 二进制从内存流式搬进 SM 指令 SRAM，边搬边算 CRC32 |
+| 同步 | `signal_id` 使 SEM[id]+=1；`wait_id` 在执行前检查 SEM[wait_id]!=0 |
+| 记账 | 推进 `CMD_HEAD`、置 `IRQ_STATUS` 位、亮 `irq_o`、记录首个 `CP_ERROR` |
+| 超时 | 每个等待都有 `TIMEOUT_CYCLES` 上限，超了就报 `CPERR_TIMEOUT` 停机 |
 
-三条硬规则:
+### 1.2 它不做什么
 
-1. **一次只做一条命令**:上一条没到完成条件,`CMD_HEAD` 不前进、下一条不取(CMDS §9 的 `UPDATE` 相);
-2. **`wait_id` 在分发前等**(§4.1 第 9 条):`SIGNAL/WAIT/FENCE/NOP` 等普通命令在**校验之后、执行之前**查;`LAUNCH/GEMM` 在自己的前置条件之后查(与参考模型 `cp.cpp:353` 同序);
-3. **任何等待都有超时**:等 `SM_DONE`、等引擎、等信号量,统一用 `TIMEOUT_CYCLES` 计数 ⇒ `CP_ERROR = TIMEOUT`(§8.1 值 4)+ 停机。
+- **不做地址翻译**：命令里的地址都是物理地址，直接送内存口。
+- **不排队**：一次只有一条命令在飞，没有命令队列硬件、没有乱序、没有多发射。
+- **不解释 kernel 语义**：只校验 `kernel_pc` 是否落在镜像内、flags 是否与镜像头一致，
+  kernel 具体干什么它不知道也不关心。
+- **不做原子操作**：信号量是"CP 单点读-改-写"，因为它自己是唯一的访问者。
+- **不校验引擎参数**：GEMM/2D 的操作数是否合理由引擎自己判，CP 只做结构性检查
+  （长度/保留位/维度范围）。
 
-`DOORBELL` 只是"提示",不是计数:CP 被触发后**连续取命令直到队列空或出错**(§2.1/§9)。落到 RTL 上是"锁存一个 pending 位",而不是"来一拍就处理一条命令" —— 尤其要覆盖"CP 正忙时 DOORBELL 又来了"(§9:期间新到的命令在下一轮取)。
+### 1.3 三条硬规则
 
----
+所有 18 个状态都围着这三条转：
 
-## 3. 对外接口(信号级)
-
-### 3.1 MMIO(host 侧,AXI4-Lite 从口)
-
-| 方向 | 信号 | 说明 |
-|---|---|---|
-| in | `s_axil_awvalid/awaddr/awprot`、`wvalid/wdata/wstrb`、`bready` | 4KB 窗口,偏移见 CMDS §7;只支持 32b 对齐访问(非对齐/多拍 ⇒ 忽略并置 `BUS_ERROR`?见 D1) |
-| out | `s_axil_awready/wready/bvalid/bresp` | 写响应固定 OKAY |
-| in | `s_axil_arvalid/araddr`、`rready` | |
-| out | `s_axil_arready/rvalid/rdata/rresp` | 读寄存器;未定义偏移返回 0 并计数(与参考模型 `cp.cpp:751` 一致) |
-| out | `irq` | `IRQ_STATUS & IRQ_ENABLE`,一条线(§7.4) |
-
-### 3.2 DMA(主口,AXI4)
-
-| 用途 | 方向 | 访问模式 |
-|---|---|---|
-| 取命令环 | 读 | 顺序;建议 **64B(16 拍)INCR 突发** |
-| `LOAD_KERNEL` 读镜像 | 读 | 顺序;按 64B 突发直到 `size_bytes` |
-| `READ_REG` 落地写、`PARAMS` 写常量区、`SIGNAL`、信号量 `+= 1` | 写 | 单字写或按行合并 |
-
-> **谁先谁后**:CP 的写必须在**分发下一条依赖它的命令之前**拿到 `B` 响应(否则 SM 可能读到旧参数)。
-> 由于 CP 只有一个主口、in-order 发请求,**只要每条写命令在自己的完成条件里等 `B` 就够**(D6)。
-> `FENCE` 在 RTL 里因此接近"空操作"(等自己所有未完成写落地),而语义上它保证的是
-> "此前所有已分发命令都到了完成条件" —— 那些命令各自已经把写冲刷完了(ISA §2.4/§2.5 + §10.3)。
-
-### 3.3 SM 侧(每个 SM 一组,共 2 组)
-
-| 方向 | 信号 | 宽度 | 说明 |
-|---|---|---|---|
-| out | `sm_launch_valid[1:0]` | 1/个 | 分发脉冲 |
-| out | `sm_launch_pc[1:0]` | 32 | = LAUNCH 的 `kernel_pc` |
-| out | `sm_launch_warps[1:0]` | 4 | `num_warps`;SM 自己按"连续打包 + 槽号 = `wid mod 4`"算出哪些槽活(ISA §2.2) |
-| out | `sm_launch_flags[1:0]` | 4 | 与镜像头交叉核对过的 `launch_flags` |
-| in | `sm_done[1:0]` | 1 | 该 SM 的 `warp_alive` 全 0(§7.1);**CP 在分发时负责清它**,SM 侧只读 |
-| in | `sm_busy[1:0]` | 1 | 可选:该 SM 是否有活跃 warp(便于区分"没启动"与"跑完了") |
-| in | `sm_error[1:0]` | 4 | SM 错误码(CMDS §8.2);`!=0` ⇒ kernel 失败 ⇒ `CP_ERROR = SM_FAULT`、**不写信号量** |
-| in | `sm_fault_pc[1:0]` | 32 | 出错现场;CP 只在 MMIO 读 `SM*_FAULT_PC` 时透传 |
-
-**注意**:`sm_launch_*` 与现有 `hw/rtl/cp/` 之外的 RTL 要对得上 —— `core/fetch.sv` 的 LAUNCH 端口是
-`launch`/`launch_pc`/`launch_warp`(lane 掩码),`simt_stack.launch_mask` 同义。**SM 顶层**负责把
-`num_warps` 翻译成"哪些 warp 的 fetch 收到 `launch`,以及 `launch_warp` = 全 1";CP 只发 `num_warps`。
-
-### 3.4 指令 SRAM 预加载(每个 SM 一组)
-
-对接 `mem/instr_mem.sv` 已有的预加载口:
-
-| 方向 | 信号 | 说明 |
-|---|---|---|
-| out | `sram_load_en[1:0]` | 写使能(按 `sm_mask` 逐位) |
-| out | `sram_load_addr[1:0]` | 13 bit 字地址(多一位用于越界自检) |
-| out | `sram_load_data[1:0]` | 32b |
-| out | `sram_load_last[1:0]` | 最后一个字那一拍 |
-| in | `sram_load_done[1:0]` | 下一拍脉冲 |
-| in | `sram_err_ovf[1:0]` | 越界(CP 已校验 `size ≤ 16KB`,它响了就是实现出事 ⇒ `CMD_ERROR`) |
-
-镜像**只读一次、同时广播给 `sm_mask` 里的每个 SM**(D3):一份数据流,两个写口,省一半带宽。
-
-### 3.5 引擎侧(2D / GEMM)
-
-SPEC §3.1 的形状 `engine_cmd = {engine[1:0], opcode[8], len[16], payload[]}` 需要落成可实现的接口:
-
-| 方向 | 信号 | 说明 |
-|---|---|---|
-| out | `eng_valid`, `eng_engine[1:0]`(0=2D,1=GEMM), `eng_opcode[7:0]`, `eng_len[15:0]` | 命令头 |
-| out | `eng_wdata[31:0]`, `eng_wvalid`, `eng_wlast` | **payload 流**(word2 起逐字推) |
-| in | `eng_ready` | 引擎能收(忙时 CP 停在这里等,不丢命令) |
-| in | `eng_status[2:0]` | `{ERROR, DONE, BUSY}`(2D:`0x68`,GEMM:`0x60` 的位定义) |
-| in | `eng_error[3:0]` / `eng_error_ext[7:0]` | 引擎错误码(`2D_ERROR` 6 位枚举 / `GEMM_ERROR`) |
-
-payload 上限:**GEMM 16 字(64B) / 2D 最大 9 字** ⇒ 引擎侧给 **16 字(64B)的输入缓冲**足够(D8);
-`PARAMS`(可达 260 字)不进引擎,由 CP 自己写常量区。
+1. **in-order，一次只做一条。** `HEAD` 只在"这条命令确认完成"的那一拍前进
+   （`cp.sv:480` 的 `head_we`）。命令失败则 HEAD 原地不动 + 停机，于是 host 读
+   `CMD_HEAD` 就能知道卡在哪条命令上 —— 这是唯一的调试锚点。
+2. **`wait_id` 在"校验之后、执行/分发之前"查**（`cp.sv:647` 的 `ST_DECODE`）。
+   不是"取命令前"，也不是"执行中"。
+3. **任何等待都有上限。** `TIMEOUT_CYCLES`（默认 `0x0010_0000`）数到就报
+   `CPERR_TIMEOUT` + 停机，不允许无限等下去。
 
 ---
 
-## 4. 内部模块划分
+## 2. 命令环与取指模型
 
-| 文件(建议) | 职责 | 关键点 |
-|---|---|---|
-| `cp/cp.sv` | 顶层:实例化 + 状态机 + 命令分发/完成的仲裁 | 只做"接线的状态机",不放数据通路 |
-| `cp/cp_fsm.sv` | CMDS §9 的状态机(IDLE/FETCH/DECODE/DISPATCH/WAIT/UPDATE/ERROR)+ 每条命令的微序列 | §5 |
-| `cp/cp_regs.sv` | MMIO 寄存器文件(CMDS §7 全表)+ 读写属性 + 复位值 | §11 |
-| `cp/axil_slave.sv` | AXI4-Lite 从口 → 寄存器读写 | 流水响应 |
-| `cp/cmd_fetch.sv` | 队列指针(`head/tail/base/size`)、64B 行缓冲、变长命令的边界检查 | §6,最易错的一块 |
-| `cp/cmd_decode.sv` | §2.4 校验表的硬件版:长度/保留位/操作数范围 | §7 |
-| `cp/kernel_loader.sv` | LOAD_KERNEL:流式读镜像 + 镜像头校验 + **CRC32** + 双 SM 广播 + 记 `{entry,flags}` | §9 |
-| `cp/sem_unit.sv` | 信号量:`+= 1`(读-改-写)、`SIGNAL`、`WAIT` 轮询、`wait_id` 判定 | §8 |
-| `cp/launch_unit.sv` | LAUNCH 九条前置条件 + 分发 + 完成判定(SM_DONE/SM_ERROR)+ 超时 | §8 |
-| `cp/engine_unit.sv` | 2D/GEMM:payload 流 + 忙/完成/错误观测 + `ENGINE_FAULT` | §10 |
-| `cp/cp_err.sv` | 首个错误保留、IRQ 聚合、停机 | §12 |
-| `cp/cp_perf.sv`(可选) | 命令计数、每类命令的等待周期数 | §13 |
+### 2.1 命令格式
 
-> `hw/rtl/cp/` 里**不要**再放一份 MMIO 从口到 `mem/`(SPEC §3.4 的"内存子系统 MMIO 从口"与
-> SPEC §3.1 的"CP 的 mmio_req/rsp"口径重叠)—— 见 §14 的 D1 与 SPEC §3.1。
+命令在内存里按 32bit 字连续排布：
 
----
+| 字 | 内容 |
+|----|------|
+| word0 | `length_words[31:16]`、`cmd_flags[15:8]`、`opcode[7:0]` |
+| word1 | `signal_id[31:16]`、`wait_id[15:0]` |
+| word2… | 各 opcode 的操作数（`cmd_decode.sv` 逐条校验） |
 
-## 5. 状态机(把 CMDS §9 展开成可实现的状态)
+`length_words` 是**整条命令的字数（含 word0/word1）**。两个信号量字段用
+`0xFFFF`（`cp_pkg::SEM_NONE`）表示"没有"。
 
-顶层:FU = 命令取指单元,EX = 命令执行/等待单元,UP = 提交(更新 `HEAD`、打信号量、置 IRQ)。
+命令体最多只有前 16 字会进 `cmd_w[0:15]`；`PARAMS` 这种最长 260 字的命令，
+超出 16 字的部分由 `ST_PARAMS` 直接按全局地址从行缓存取（`cp.sv:816`）。
+
+### 2.2 队列指针
 
 ```
-        ┌──────────┐  DOORBELL & HEAD!=TAIL
-        │  C_IDLE  │──────────────────────────┐
-        └────┬─────┘                          │
-             │ HEAD==TAIL                    ▼
-             │                        ┌────────────┐
-             │                        │ C_FETCH_HDR│ 读 word0/word1(一次 64B 行缓冲)
-             │                        └─────┬──────┘
-             │                              ▼
-             │                        ┌────────────┐  长度/保留位/opcode 非法
-             │                        │ C_DECODE   │───────────────► C_ERROR
-             │                        └─────┬──────┘
-             │                              ▼
-             │                        ┌────────────┐  需要 wait_id / 需要等引擎
-             │                        │ C_DISPATCH │──────► C_WAIT_DEP(信号量)
-             │                        └─────┬──────┘──────► C_WAIT_DONE(SM/引擎)
-             │                              │ 立即完成类命令
-             │                              ▼
-             │                        ┌────────────┐
-             └────────────────────────│ C_UPDATE   │  HEAD += len*4(含回绕)、SEM[id]+=1、IRQ
-                                      └─────┬──────┘
-                                            │ 任一等待超时 / BUS_ERROR / SM 报错
-                                            ▼
-                                      ┌────────────┐
-                                      │ C_ERROR    │ 停机: 锁首个错误 + IRQ_CP_ERROR
-                                      └─────┬──────┘
-                                            │ host 写 CP_RESET
-                                            └──────► C_IDLE
+ queue_base                                  queue_base + queue_size
+    │                                                    │
+    ▼                                                    ▼
+    ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐    环形缓冲
+         ▲                             ▲
+         │                             │
+       HEAD                          TAIL
+  (CP 已完成到这里)              (host 已写到这里)
+   已消费 / 可回填               已发布 / 未消费
+    head == tail  ⇒  队列空
 ```
 
-子状态(在执行单元内部,不暴露给 MMIO):
+- `HEAD` 由 CP 推进；`TAIL` 由 host 推进；两者相等 ⇒ 队列空。
+- host 写 `DOORBELL` 只是"敲一下"，真正的判据是 `head != tail`
+  （`cp.sv:223` 的 `queued`）。空队列敲门时 CP 顺手把 `doorbell_pend` 消费掉。
+- `CMD_HEAD` / `CMD_TAIL` 同时可读可写；host 写 `HEAD` 可以在 `[base, base+size)`
+  内任意搬（用于把队列搬回已消费区域），越界或未对齐的写被静默丢弃。
 
-| 子状态 | 干什么 |
-|---|---|
-| `X_STREAM` | 把命令体的第 3..len 字流给消费者(常量区写 / 引擎 FIFO / SRAM 预加载) |
-| `X_DMA_W` | 发起一次写(DMA),等 `B` 响应 |
-| `X_DMA_R` | 发起一次读,等 `R` 数据 |
-| `X_SEM_RMW` | 信号量 `+= 1` 的读-改-写三拍 |
-| `X_POLL` | 轮询等待(`WAIT` 命令、`wait_id`),每 N 拍重读一次(D6) |
-| `X_LAUNCH` | 断言 `sm_launch_*` 一拍,然后进 `C_WAIT_DONE` |
-| `X_DONE` | 命令完成,回 `C_UPDATE` |
+### 2.3 两级取指：命令缓存 + 64B 行缓冲
 
-上面的 `C_*` / `X_*` 是**概念状态**,便于对着 CMDS §9 讨论;RTL 里落地成 **21 个 `ST_*` 状态**(`cp.sv` 的 `cp_state_t`),两者的对应关系:
+命令体是连续的字，一条命令常常要读 5～16 个字。取指分两级：
 
-| 概念状态 | RTL 状态 | 说明 |
-|---|---|---|
-| `C_IDLE` | `ST_IDLE` | 等 `DOORBELL` 且 `HEAD != TAIL` |
-| `C_FETCH_HDR` | `ST_LOADW` / `ST_LOADW2` | 读 word0/word1;行缓存 64B,一条命令一次取行 |
-| (校验) | `ST_LENCHK` / `ST_DECODE` | CMDS §2.4 的长度/保留位/opcode 校验(只占 2 拍,不设独立概念状态) |
-| `C_DISPATCH` | `ST_EXEC` | 按 opcode 分派;`WRITE_REG`/`READ_REG`/`NOP` 等立即完成类也在这里一次做完 |
-| `X_STREAM` | `ST_PARAMS`/`ST_PARAMS_RET`、`ST_LOADK`/`ST_LOADK_ND`、`ST_ENG_SEND` | 常量区写、镜像读 + SRAM 预加载 + CRC、引擎 payload 流 |
-| `X_DMA_R`/`X_DMA_W` | `ST_MEM` | **一个状态复用于 7 类操作**(经 `ret_st` 记录返回点):读行、读字、写字、SRAM 预加载读、`READ_REG` 落地写、PARAMS 写、信号量读写 |
-| `X_POLL` | `ST_POLL` / `ST_POLL_WAIT` | `WAIT` 命令与 `wait_id` 的轮询;`poll_gap` 做 8 拍节流,实测重读周期 12 拍 |
-| `X_LAUNCH` | `ST_LAUNCH` | 断言 `sm_launch_*` **一拍** |
-| `C_WAIT_DONE` | `ST_WAIT_SM` / `ST_WAIT_ENG` | 等 `SM_DONE` / 引擎 `DONE`(电平协议) |
-| `X_SEM_RMW` | `ST_SEM_WR` | 信号量 `+= 1` |
-| `C_UPDATE` | `ST_UPD` / `ST_UPD_FIN` | 推进 `HEAD`(组合写法,见 §6)、清行缓存、置 IRQ |
-| `C_ERROR` | `ST_ERR` | 锁首个错误,等 `CP_RESET` |
+**① 命令缓存 `hw/rtl/cache/cmd_cache.sv`（跨命令驻留）**
 
-> 状态数与拍数无关:单条 `NOP` 的墙钟 8.4 拍(未对齐)/ 31 拍(64B 对齐后的取指行),多出来的状态都是**一拍臂**;把它们合并只会把状态位换成 flag 位,面积不减、可调试性变差。
+- 64 组 × 64B 行 = 4KB，正好覆盖整个默认命令环（`CMD_QUEUE_SIZE = 4096`），
+  直接映射，标签/有效位/epoch 放 `tagv_sram`，16 个字位各放一个 `data_bank_sram`
+  （与 `~/LoongArch32/myloong/core3/icache.v` 同一套 SRAM 划分）。
+- CP 要一整行时给 `cc_req + cc_req_line`；**命中 2 拍**（accept + 标签/数据同拍
+  读出）。缺失时向内存发一次读，回来的数据按 AXI R 的节奏**一拍一个字**直接写进
+  对应字位的 bank（16 拍）。
+- **回填的最后一拍顺带发 SRAM 读**：那一拍 16 个 bank 里只有"最后一个字"所在的那个
+  在做写（SRAM 同拍读写不绕回），其余 15 个 bank 读出来就是新数据；最后一个字单独
+  记进 `last_word_q`，下一拍拼成整行回给 CP。所以缺失只比命中多"16 拍数据 + 1 拍
+  回话"，没有额外的读回状态。
+- **预取在缓存内部**：每次真实请求拿到行 L 之后，缓存自己挂上"预取 L+1"，
+  下一次空闲就去读（只挂一次、不链式，被真实请求抢占也不会丢）。上界由
+  `ring_end_line = (queue_base + queue_size) >> 6` 给出，环外的行不预取。
+  `tail` 之后还没发布的区域**允许**读进来：host 每次写 `TAIL`/`DOORBELL`
+  都会整片失效，不会读到半条命令。
+- 失效用 epoch：`CP_RESET`、host 写 `DOORBELL`、host 写 `CMD_HEAD` /
+  `CMD_TAIL` / `CMD_QUEUE_BASE` / `CMD_QUEUE_SIZE`，以及复位，都让 epoch+1
+  （一拍作废全部行，不逐项清）。理由见 §2.2：这几种事件之后环里的字节才可能变。
 
-**每条命令的微序列**(实现时照着写):
+**② 64B 行缓冲 `line_buf`（生命周期 = 一条命令）**
 
-| 命令 | 微序列 |
-|---|---|
-| NOP | 校验 → 跳过 `len*4` 字节 → UPDATE |
-| WRITE_REG | 校验(可写表)→ 寄存器写入(内部)→ UPDATE |
-| READ_REG | 校验 → `X_DMA_R`(读 MMIO 寄存器)→ `X_DMA_W`(写 `dst_addr`)→ UPDATE |
-| SIGNAL | 校验 → `X_DMA_W` → UPDATE |
-| WAIT | 校验 → `X_POLL`(`SEM[addr] >= value`)→ UPDATE |
-| IRQ | 校验 → 置 `IRQ_STATUS[irq_id]` → UPDATE |
-| PARAMS | 校验 → `X_STREAM` 写常量区(按 64B 突发写)→ UPDATE |
-| FENCE | 等自身未完成写落地 → UPDATE |
-| LOAD_KERNEL | 校验 → `X_STREAM` 读镜像 + 写 SRAM + CRC → 比 CRC/flags → 置 `SM_KERNEL_MASK` → UPDATE |
-| LAUNCH | 九条前置检查 → `wait_id` → `X_LAUNCH` → `C_WAIT_DONE` → 完成判定 → UPDATE |
-| GEMM / 2D_* | 长度/保留位校验 → `wait_id` → `X_STREAM` 推 payload → `C_WAIT_DONE`(等引擎)→ UPDATE |
-| 厂商自定义(0x80+) | 只按 `length_words` 跳过(§2.4)→ UPDATE |
+- `ST_MEM/OP_RD_LINE` 从命令缓存拿回 16 个字塞进 `line_buf[0:15]`，记
+  `line_base` 并置 `line_valid`；同一行内的字直接命中（`line_hit`）。
+- `ST_UPD_FIN` 里**无条件**清 `line_valid`：命令之间的可见性由命令缓存负责，
+  行缓冲只管"这一条命令的 16 个字"，这样两条命令之间不会残留任何状态。
+- 命令跨 64B 边界时退化成对命令缓存的又一次行请求（语义与单字读相同）。
+- CP 自己的单字读写与命令缓存共用 CP 的内存口：单字读只回一拍（与行读同一条
+  `rd_vld/rd_word/rd_last` 通路），单字写仍是 req → ack → 完成应答。
+
+**失效与正确性**：命令环只有一个写者（host），它的发布顺序永远是"先写命令
+字节、再写 `CMD_TAIL` / `DOORBELL`"。因此只要这几种事件都让缓存失效，CP 就
+不会读到旧命令 —— 即使驱动把 `HEAD` 搬回已消费区域重写那里也一样。
+
+### 2.4 三处长度/边界判定
+
+在 `ST_LOADW` 取到 word1 的那一拍（`cp.sv:598` 起），一次判完三件事：
+
+| 条件 | 含义 | 错误 |
+|------|------|------|
+| `len_q < 2` | 任何命令至少 2 字 | `CPERR_CMD` |
+| `next_head_raw > queue_base + queue_size` | 命令不许跨环末尾 | `CPERR_CMD` |
+| `tail >= head && next_head_raw > tail` | 不许读 host 还没写的区域 | `CPERR_CMD` |
+
+`next_head_raw = head + len*4` 是"未回绕值"，回绕只在 `next_head_raw ==
+queue_base + queue_size` 时发生，即**恰好等于末尾才允许回绕**：驱动要用 NOP 把
+队列末尾填平，不能指望 CP 自动折返。
+
+### 2.5 HEAD 什么时候动
+
+只有一处：`head_we = (state == ST_UPD_FIN) & (sig_rd_sent | ~sig_ok_q)`
+（`cp.sv:480`）。做成组合脉冲而不是写进某个分支，因为它必须和"清行缓存"落在
+同一拍上。`sig_rd_sent` 负责区分信号量 RMW 的两趟（见 §8.2）。
 
 ---
 
-## 6. 命令取指与队列指针(实现里最容易错的一块)
+## 3. 对外接口
 
-寄存器:`queue_base`、`queue_size`、`head`、`tail`(全局字节地址)。
+### 3.1 六组端口（`cp.sv:45` 起）
 
-1. **行缓冲**:一次 DMA 读 **64B(16 字)**到 `cmd_line[0:15]`,地址 = `head & ~63`(D2)。
-   命令头一定是 `head` 起的前两个字;命令体从 `head+8` 起。行缓冲只在"命令确实落在这 64B 内"时可用;
-   否则(命令跨 64B 边界)**退化成逐字读**。驱动按 64B 填充时永远走快路径。
-   - **行缓冲的生命周期 = 一条命令**:完成判定那一步(`ST_UPD_FIN`)无条件清 `line_valid`。
-     这是**正确性**要求而不是优化取舍:host 可以在命令之间改写队列里已被消费的区域 ——
-     写 `CMD_HEAD`/`CMD_QUEUE_BASE`/`CMD_QUEUE_SIZE` 会把 `head` 搬回已被消费过的位置,环形队列回绕也会回到同一行。
-     若跨命令复用行缓冲,CP 就会拿"旧命令的字节"重新取指(实测:改 `BASE` 搬回原基址后,缓存里的旧 `2D_FILL`
-     被当成新命令执行)。参考模型没有缓存(逐字读内存),所以这条也保证了 RTL 与模型一致。
-     代价:未按 64B 填充的命令流从"每行 2~3 条命令"退回"每条命令一行",按 §2.1 填充的驱动不受影响(本来就一条一行)。
-2. **长度**:`length_words = word0[31:16]`;**`< 2` ⇒ `CMD_ERROR`**(§2.4)。
-3. **不得跨越队列末尾**:`head + len*4 > base + size` ⇒ `CMD_ERROR`(驱动应当用 NOP 填到末尾,§2.1)。
-4. **不得越过 `CMD_TAIL`**:命令体必须整个落在 `[head, tail)` 里(考虑回绕)。
-   参考模型的判据是 `cp.cpp:328-337`,`RTL` 用一个 `wrap` 位 + 两次比较实现同一件事 —— **这一条要用穷举用例测**(现有 `test_queue_boundary_errors` 覆盖越界与回绕)。
-5. **`head` 的推进**在完成判定之后(`C_UPDATE`);失败的命令**不推进** `head`,而是进 `C_ERROR` 停机 ⇒ 不会重复执行(与 `cp.cpp:358-361` 同语义)。
-6. `head`/`tail` 的写:host 可写 `CMD_TAIL`(驱动契约)、`CMD_HEAD`(异常恢复);`CMD_QUEUE_BASE/SIZE` 只在 **CP IDLE 且队列为空**时允许改(§2.1)。
-   - **改写 `CMD_HEAD`/`CMD_QUEUE_BASE`/`CMD_QUEUE_SIZE` 之后,CP 必须重新从内存取指**:这三个寄存器会把 `head` 搬回已被消费的环位置,
-     所以取指行缓存不能在命令之间存活(见上面第 1 条)。回归用例:`tb/tests/cp/test_cp.py::test_queue_cfg_rules` 的最后一步
-     (改 `BASE` 到别处再搬回来,然后提交一条命令,必须按内存里的新命令执行)。
-   - **两条访问路径的错误报告方式不同**(`cp.sv` + `cp_regs.sv` 的实现就是按这个分工写的):
-     - 经 `WRITE_REG` 命令改 ⇒ **时机不对报 `ILLEGAL_STATE`、取值不对报 `CMD_ERROR`**(判定在 `cp.sv` 的 `ST_DECODE`:`wr_reg_bad_state`/`wr_reg_bad_value`);
-     - host 直写 MMIO ⇒ **该写被忽略、寄存器保持原值、不置 `CP_ERROR`**(门控在 `cp_regs.sv` 的 `ext_wr_now = ext_wr & (que_cfg_wr ? idle_i : 1'b1)`;host 直写不挂在任何命令上,没有可归属错误的命令)。
-   - `CMD_QUEUE_SIZE` 的取值必须 **≥ 8 且为 8 的倍数**(§2.1 + §6.1 的 NOP ≥ 2 字),否则按上面的分工处理;`0` 会让取模除零(参考模型修过一个 SIGFPE,`run_tests.py:266` 有用例)。取值规则在两条路径上**一致**(`cp_regs.sv:232` 的 `wr_data >= 8 && wr_data[2:0] == 0` 与 `cp.cpp` 的 `write_reg`/`WRITE_REG` 判定同规则)。
-   - `CMD_QUEUE_BASE` 必须 4B 对齐且不在 MMIO 窗口;时机规则同上,取值非法时两条路径同样一个报错、一个忽略。
-   - **例外:`CMD_HEAD` 只有 host 直写这一条写路径**(`WRITE_REG` 写它 ⇒ `CMD_ERROR`):它是 CP 的读取指针,命令流改它等于让 CP 跳过/重读命令;
-     "丢弃未处理命令"是 `CP_RESET` 的职责(§7.3)。`CMD_TAIL` 相反 —— 它是驱动的前进指针,允许在命令流里推进。
-   - 两条路径写的是**同一个寄存器**(一份状态,没有副本),差别只在"错误怎么报"——见 SPEC.md §3.1 契约 5~7。
+| 组 | 信号 | 说明 |
+|----|------|------|
+| host | `s_awvalid/awready/awaddr`、`s_wvalid/wready/wdata/wstrb`、`s_bvalid/bready/bresp`、`s_arvalid/arready/araddr`、`s_rvalid/rready/rdata/rresp` | AXI4-Lite 从口，4KB MMIO 窗口 |
+| 中断 | `irq` | 电平中断，= `irq_status & irq_enable` 的按位或归约 |
+| 内存 | `mem_rd_{req,addr,line,ack,vld,word,last,err}`、`mem_wr_{req,addr,data,strb,ack,rsp,err}` | 读:req/ack + 按拍送字;写:req/ack/rsp |
+| SM | `sm_launch_{valid,pc,warps,flags}`、`sm_done`、`sm0/1_{error,fault_pc}` | 分发脉冲 + 完成/错误回读 |
+| SRAM | `sram_load_{en[1:0],addr[12:0],data,last[1:0]}`、`sram_load_done[1:0]`、`sram_err_ovf[1:0]` | 镜像预加载广播 |
+| 引擎 | `eng_valid/engine/opcode/len/ready`、`eng_w{valid,data,last}`、`gemm/2d_{status,error}` | 结构化 payload 流 |
+
+### 3.2 内存口时序（CP 侧视角）
+
+下游 `cp_mem_adapter.sv` 把它翻成 AXI4。对 CP 来说只有三个时刻：
+
+读是"请求 / 接受 / 按拍送字"三段，写是"请求 / 接受 / 落地应答"三段：
+
+```
+      t0      t1      t2                    t2+15      t2+16
+req   ▔▔▔▔▔▔▔▔▔▔▔╲____________________（保持到 ack）
+addr  ▔▔▔▔▔▔▔▔▔▔▔▔（全程稳定）
+ack   __________▔▔▔╲__________________   单拍，表示"请求被接受"
+vld   ________________▔▔▔▔▔▔▔▔▔▔▔▔▔▔╲______   行读连续 16 拍，字读 1 拍
+word  ________________══════════════════════   与 vld 同拍的一个 32 位字
+last  ____________________________▔▔▔╲______   最后一拍
+err   ____________________________▔▔▔╲______   与 last 同拍（总线错误）
+```
+
+- CP 一次只有一个内存在飞，所以 `ST_MEM` 里一个 `req_sent` 位就够管握手；
+- `cp_ret_state` 记住"做完回哪个态"，一个状态复用给读行/读字/写字/信号量读写
+  等全部 7 类访问；
+- 读 64B 行在 adapter 里是两段 8 拍 INCR burst（`arlen=7`），但**对 CP 与命令缓存
+  都是一条 16 拍的 beat 流**——行内第几个字就是第几拍，中间不攒 512 位行缓冲；
+  读 4B 字只有一拍（与行读同一条 `vld/word/last` 通路）。
+
+### 3.3 MMIO 访问
+
+`axil_slave.sv` 是每通道单事务在途的简单从口：等 `aw`+`w` 齐了打一拍 `reg_wr`
+脉冲，`ar` 来了打一拍 `reg_rd`。响应固定 `OKAY`；地址高位不为 0（`awaddr[31:12]`）
+的访问被当作 bad，**静默丢弃且不回 SLVERR** —— 驱动不能靠 SLVERR 发现写错地址。
 
 ---
 
-## 7. 校验表在 RTL 里的落地(§2.4)
+## 4. 文件划分（实际存在的）
 
-`cmd_decode.sv` 就是 CMDS §2.4 那张表的硬件版,输出 `{ok, err_code, len_expected, reserved_mask}`:
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `cp.sv` | 1128 | 18 态主状态机 + 全部组合握手；本文的主角 |
+| `cp_regs.sv` | 262 | 唯一一份寄存器副本；ext（AXI-Lite）与 int（状态机）两个访问口 |
+| `cmd_decode.sv` | 181 | 纯组合校验器：长度/保留位/对齐/窗口/opcode 语义 |
+| `axil_slave.sv` | 96 | AXI4-Lite → 单拍 `reg_wr` / `reg_rd` |
+| `crc32_word.sv` | 33 | 每拍 4 字节的 CRC32（poly `0xEDB88320`，小端），与 zlib 一致 |
+| `cp_pkg.sv` | 69 | 错误码、引擎编号、长度常量、flag 位、IRQ 位 |
+| `cp_mem_adapter.sv` | 183 | （在 `hw/rtl/mem/`）req/ack ↔ AXI4 主口；读按 beat 流回数据，64B 行 = 两段 burst |
+| `cache/cmd_cache.sv` | 295 | （在 `hw/rtl/cache/`）命令缓存，见 §2.3 |
+| `cache/cache_sram.sv` | 92 | （在 `hw/rtl/cache/`）`tagv_sram` + `data_bank_sram` 基础件 |
 
-| opcode | 长度 | 保留位必须为 0 | 额外校验 |
-|---|---|---|---|
-| 0x00 NOP | ≥2 | — | — |
-| 0x01 WRITE_REG | =4 | — | `addr` 4B 对齐、在 MMIO 窗口内、**在可写表里** |
-| 0x02 READ_REG | =4 | — | `addr` 对齐且在 MMIO;**`dst` 对齐且不在 MMIO 窗口** |
-| 0x03 LOAD_KERNEL | =5 | `w4[31:2]` | `size ≤ 16384`、4 的倍数、`sm_mask != 0`、`src` 对齐 |
-| 0x04 LAUNCH | =5 | `w3[31:8]` | §4.1 九条(见 §8) |
-| 0x05 FENCE | =2 | — | — |
-| 0x06 SIGNAL | =4 | — | `sem_addr` 对齐且不在 MMIO 窗口 |
-| 0x07 WAIT | =4 | — | `sem_addr` 对齐 |
-| 0x08 IRQ | =3 | `w2[31:8]` | `irq_id ≤ 7` |
-| 0x09 PARAMS | =4+N | `w2[31:16]`、`w3[31:16]` | `dst_off` 对齐且 `<4096`;`1 ≤ N ≤ 256`;`off + N*4 ≤ 4096` |
-| 0x0A–0x0F | — | — | 保留 ⇒ `CMD_ERROR` |
-| 0x10–0x14 | **固定** 6/9/8/4/2 | 各命令见 GFX §4.1–4.6 | 长度不等于规定值 ⇒ `CMD_ERROR`;参数/几何问题**不在这里报**(引擎报 `2D_ERROR`) |
-| 0x15–0x17 | ≥2 | — | v1 保留 ⇒ 转发给 2D 引擎,由引擎报 `BAD_PARAM`(GFX §7.3 值 6) |
-| 0x18 GEMM | =16 | `w10[31:16]`、`w12[31:8]`、`w13..w15` | 基址 16B 对齐;`1 ≤ M,N,K ≤ 4096`;`lda/ldb/ldc` 合法;`dtype==0`;`REQUANT` 未实现 ⇒ `CMD_ERROR` |
-| 0x19–0x7F | — | — | 保留 ⇒ `CMD_ERROR` |
-| 0x80–0xFF | ≥2 | — | **按长度跳过**并计数(厂商自定义) |
-
-命令头的**两处通用校验**(在 `cmd_fetch` 里,先于 opcode):
-`cmd_flags[7:2] != 0` ⇒ `CMD_ERROR`;`signal_id`/`wait_id` 落在 `0x0100..0xFFFE` ⇒ `CMD_ERROR`(`cp.cpp:338-344`)。
+数据流是单向的、没有环：`cp.sv` 读 `cp_regs` 的配置、把校验结果写回 `cp_regs`；
+`cmd_decode` 只吃 `cp.sv` 的组合输出并吐 `ok/err`。
 
 ---
 
-## 8. 依赖与完成判定
+## 5. 状态机
 
-### 8.1 信号量单元(`sem_unit.sv`)
+### 5.1 18 个状态（`cp.sv:150`）
 
-- 地址 = `SEM_BASE + id*4`,`id ∈ 0..255`;`0xFFFF` = 无依赖(`SEM_NONE`)。
-- **完成计数**:命令完成 ⇒ `SEM[id] += 1`,实现是 `X_SEM_RMW` 三拍(读 → +1 → 写),**不缓存值**(多命令串行,不需要 cache)。
-- **`SIGNAL`**:直接写指定地址。
-- **`WAIT`**:轮询 `SEM[addr] >= value`(**`>=` 而不是 `==`**,§6.7);每 N 拍重读一次(D6)。
-- **`wait_id`**:判据是 `SEM[wait_id] != 0`(`cp.cpp:379`),RTL 与模型一致;该口径已回填到 CMDS §10.2(命令头没有比较值字段,要等具体数值请用 `WAIT`)。
+| 组 | 状态 | 干什么 |
+|----|------|--------|
+| 取 | `ST_IDLE` | 等 DOORBELL / 队列非空。空队列敲门时只 ack，不前进 |
+| 取 | `ST_LOADW` | 取第 `idx` 个字；`idx=0` 抽 word0，`idx=1` 抽 word1 并做三判（§2.4） |
+| 取 | `ST_LOADW2` | 补齐命令体到 `min(len,16)` 字，然后锁出 `w2/w3/w4` |
+| 取 | `ST_DECODE` | 跑 `cmd_decode` + 各命令前置条件，决定进 `ST_EXEC` 还是先轮询 |
+| 执行 | `ST_EXEC` | 按 opcode 分派；本身几乎不占时序，只设参数和下一个态 |
+| 执行 | `ST_MEM` | 唯一的内存执行器：读行 / 读字 / 写字，完成回 `cp_ret_state` |
+| 执行 | `ST_PARAMS` | 逐字写常量区；发起写时 `idx` 就自增，直接回自己 |
+| 执行 | `ST_LOADK` | 逐字读镜像 → 写指令 SRAM（按 `sm_mask` 广播）+ 喂 CRC |
+| 执行 | `ST_LOADK_ND` | 等 SRAM 装完，校验镜像头 + CRC；全过才置 `SM_KERNEL_MASK` |
+| 执行 | `ST_LAUNCH` | 一拍分发（`sm_launch_valid` 由组合逻辑直接给出） |
+| 执行 | `ST_WAIT_SM` | 等涉及的 SM 全部 DONE；任一报错 ⇒ `SM_FAULT`，且不写信号量 |
+| 执行 | `ST_ENG_SEND` | 先推引擎头，再逐字推 payload（`eng_ready` 背压） |
+| 执行 | `ST_WAIT_ENG` | 等引擎 `DONE && !BUSY` |
+| 执行 | `ST_POLL` | 发一次目标字读（信号量 / 任意同步地址） |
+| 执行 | `ST_POLL_WAIT` | 判读回值，并用 `poll_gap` 做 8 拍节流 |
+| 提交 | `ST_UPD_FIN` | 推进 HEAD、清行缓存、置 IRQ；要加信号量时先去 `ST_SEM_WR` |
+| 提交 | `ST_SEM_WR` | `SEM[id] += 1`（读-改-写由 CP 单点完成） |
+| 错误 | `ST_ERR` | 锁首个错误后停机，只认 `CP_RESET` |
 
-### 8.2 LAUNCH 的九条前置条件(§4.1,顺序不能变)
-
-| # | 条件 | RTL 判定 | 失败码 |
-|---|---|---|---|
-| 1 | 长度/保留位 | `cmd_decode` | `CMD_ERROR` |
-| 2 | 涉及 SM 的 `SM*_ERROR == 0` | `sm_error[sm_mask]` 全 0 | `STALE_SM_ERROR` |
-| 3 | `1 ≤ num_warps ≤ 8` | 比较器 | `CMD_ERROR` |
-| 4 | `kernel_pc` 4B 对齐且 `< image_size` | 与记录的 `image_size` 比 | `CMD_ERROR` |
-| 5 | 涉及 SM 都加载过镜像 | `SM_KERNEL_MASK & sm_mask == sm_mask` | `CMD_ERROR` |
-| 6 | `launch_flags` 与镜像头 `image_flags` 逐位一致 | 保存的 `image_flags` 与 `w4` 比 | `CMD_ERROR` |
-| 7 | barrier/shared/single-SM 且 `num_warps ≥ 5` | `flags[0]|flags[1]|flags[3]` 与 `num_warps>4` | `LAUNCH_REJECT` |
-| 8 | 常量区已写好 | 无法机械校验(驱动契约,§4.1 第 8 条) | — |
-| 9 | `wait_id` 满足 | §8.1 | `TIMEOUT` |
-
-**第 2 条必须排在 `num_warps` 之前**(`run_tests.py:240` 有用例守着:SM 有错时报 `STALE_SM_ERROR` 而不是 `CMD_ERROR`)。
-
-### 8.3 LAUNCH 完成判定(§4.3)
+### 5.2 主干
 
 ```
-分发时: 清涉及 SM 的 SM_DONE(通过 sm_launch_valid 脉冲,SM 侧负责清 warp_alive)
-等待:   所有 sm_mask 位对应 SM 的 sm_done == 1
-       └─ 任一 sm_error != 0  ⇒ CP_ERROR = SM_FAULT(=7)、不写信号量、置 IRQ
-       └─ 超过 TIMEOUT_CYCLES  ⇒ CP_ERROR = TIMEOUT
-完成:   SEM[signal_id] += 1(若 signal_id != 0xFFFF)、置 IRQ_LAUNCH_DONE
+取命令    ST_IDLE ──► ST_LOADW ──► ST_LOADW2 ──► ST_DECODE
+                       ▲  ▲                        │
+                       └──┴── 行未命中: 读一次 64B 行, 回到 ST_LOADW/ST_LOADW2
+                                                   │ ok 且 wait_id 已满足
+                                                   ▼
+执行      ST_EXEC 按 opcode 分到下面六条支路之一:
+            ├─ 内存类   ST_MEM            (读行 / 读字 / 写字, 完成回 cp_ret_state)
+            ├─ 常量区   ST_PARAMS         (N 次写, 发起即 idx++, 直接回自己)
+            ├─ 装镜像   ST_LOADK → ST_LOADK_ND
+            ├─ 跑 kernel ST_LAUNCH → ST_WAIT_SM
+            ├─ 引擎     ST_ENG_SEND → ST_WAIT_ENG
+            └─ 轮询     ST_POLL ⇄ ST_POLL_WAIT
+
+提交      ST_UPD_FIN
+            ├─ 第一次进来且带 signal_id ──► ST_MEM(读 SEM) ──► ST_SEM_WR ──► 回 ST_UPD_FIN
+            ├─ 收尾那一拍: HEAD 前进 + 清行缓存 + 按需置 CMD_DONE
+            ├─ 还有命令 ──► ST_LOADW
+            └─ 队列空   ──► ST_IDLE
+
+错误      任何状态遇错 ──► ST_ERR (锁首错、停机、只认 CP_RESET)
 ```
 
-> `SM_DONE` 的清除时机是 §4.3 特意点出来的坑:不清就会**第二个 kernel 立刻"完成"**,
-> 信号量提前释放,2D 读到没算完的顶点。RTL 里把它做成"分发脉冲的一部分",不要依赖 host。
+### 5.3 各命令的状态路径
+
+| 命令 | 路径 |
+|------|------|
+| NOP / FENCE | `EXEC → UPD_FIN` |
+| WRITE_REG | `EXEC`（置 `int_wr`）`→ UPD_FIN` |
+| READ_REG | `EXEC → MEM`（写字到全局内存）`→ UPD_FIN` |
+| SIGNAL | `EXEC → MEM`（写 value）`→ UPD_FIN` |
+| WAIT | `EXEC → POLL ⇄ POLL_WAIT → UPD_FIN` |
+| IRQ | `EXEC → UPD_FIN` |
+| PARAMS | `EXEC → PARAMS ×N → UPD_FIN` |
+| LOAD_KERNEL | `EXEC → LOADK ×N → LOADK_ND → UPD_FIN` |
+| LAUNCH | `EXEC → LAUNCH → WAIT_SM → UPD_FIN` |
+| GEMM / 2D_* / 0x15-0x17 | `EXEC → ENG_SEND ×N → WAIT_ENG → UPD_FIN` |
+| 厂商自定义 0x80-0xFF | `EXEC → UPD_FIN`（按 `length_words` 直接跳过） |
+
+带 `signal_id` 的命令在 `UPD_FIN` 里多两趟：`→ MEM`（读 SEM）`→ SEM_WR`（写回）`→ UPD_FIN`。
+
+---
+
+## 6. 命令逐条走查
+
+### 6.1 NOP（0x00）
+
+长度任意（≥2）。`cmd_flags` 保留位必须为 0；`signal_id` 若给则也要加信号量。
+用途：**填充队列末尾**，让上一条命令恰好停在 `queue_base + queue_size` 上（§2.4）。
+行命中时一条 2 字 NOP 是 7 拍（IDLE / LOADW×2 / LOADW2 / DECODE / EXEC / UPD_FIN），
+每多一个字 +1 拍。
+
+### 6.2 WRITE_REG（0x01）
+
+`w2 = addr`，`w3 = data`。走内部写口，**同拍生效**（`int_rdata` 是组合读，所以
+紧接着的 READ_REG 能读到刚写的值）。除 `cmd_decode` 的通用检查外，`ST_DECODE`
+还有两道额外校验（组合门槛在 `cp.sv:284` 起，判断在 `ST_DECODE` 里）：
+
+- `CP_QUEUE_BASE` / `CP_QUEUE_SIZE`：值必须合法（`>= MMIO_END` 且 4B 对齐 /
+  `>= 8` 且 8 的倍数），否则 `CPERR_CMD`；
+- 且时机必须是**本命令是队列里最后一条 且 没有 kernel 在跑**，否则
+  `CPERR_ILLEGAL_STATE`。理由：改队列基址会让 `HEAD`/`TAIL` 一起跳到新基址，
+  后面还有命令在排队就会读到垃圾。
+
+注意这条命令**不能**写 `CMD_HEAD`、`SM_DONE`、`SM_KERNEL_MASK`、`FAULT_PC`、
+`CONST_BASE`、`DDR_BASE`、`CP_STATUS`（不在 `cp_regs` 的白名单里 ⇒ `CPERR_CMD`）。
+host 侧直写不受这个白名单限制（只有 `QUEUE_*` 受 `idle_i` 门控）。
+
+### 6.3 READ_REG（0x02）
+
+`w2 = 寄存器地址`（< `MMIO_END`），`w3 = 目标地址`（>= `MMIO_END`，4B 对齐）。
+读是组合的，写是一次单字内存写。这是 host 以外唯一能把 CP 寄存器值带到内存的途径，
+常用于自检。
+
+### 6.4 SIGNAL（0x06）
+
+`w2 = 地址`，`w3 = 值`。语义就是"往全局内存指定地址写一个值"，与信号量单元
+（`SEM[id] += 1`）无关 —— 后者是每条命令按 `signal_id` 自动做的。
+
+### 6.5 WAIT（0x07）
+
+`w2 = 地址`，`w3 = 达标值`。判据是 `*addr >= value`（无符号）。地址要求
+`>= MMIO_END`（不在 MMIO 窗口里，`cmd_decode.sv:109`），这点旧文档漏了。
+它是真等待，不是"轮询一次就过"。
+
+### 6.6 IRQ（0x08）
+
+`w2[7:0] = irq_id`（0..7），直接 `IRQ_STATUS[irq_id] = 1`。与 `cmd_flags[1]`
+（`CFLAG_IRQ_ON_DONE`）的区别：后者是"这条命令完成时自动置 `CMD_DONE`(bit1)"，
+IRQ 命令是"显式置任意一位"。
+
+### 6.7 PARAMS（0x09）
+
+`w2[15:0] = dst_off`，`w3[15:0] = N`，随后 N 个数据字。逐个写到
+`CONST_BASE + dst_off + i*4`。N ≤ 256、整条长度必须等于 `4+N`、
+`dst_off + N*4 <= 4096`。
+
+实现上 `ST_PARAMS`（`cp.sv:816`）"发起一次写就 `idx++`，然后回自己"，省掉一趟
+回程态。注意它按需从行缓存补字，所以**不要求** N ≤ 12（`cmd_w` 只装得下
+16 字，超出部分是直接从内存取的）。
+
+### 6.8 FENCE（0x05）
+
+长度必须 2，几乎空转。因为 CP 本身 in-order 且每条命令都等到完成才推进，
+FENCE 在单 CP 模型下没有额外语义，保留它是为了与 `docs/CMDS.md` 对齐。
+
+### 6.9 LOAD_KERNEL（0x03）
+
+见 §9。
+
+### 6.10 LAUNCH（0x04）
+
+见 §10。
+
+### 6.11 GEMM（0x18）/ 2D（0x10-0x17）
+
+见 §11。
+
+### 6.12 厂商自定义（0x80-0xFF）
+
+`cmd_decode` 只要求 `len >= 2` 和通用头合法，然后 CP 按长度整条跳过。
+这是给 host 塞"元数据/调试记录"用的后门。
+
+---
+
+## 7. 校验规则（`cmd_decode.sv` 全表）
+
+### 7.1 通用头（所有命令）
+
+| 检查 | 错误 |
+|------|------|
+| `length_words >= 2` | `CPERR_CMD` |
+| `cmd_flags[7:2] == 0`（bit0/1 是 SYNC / IRQ_ON_DONE，不在这里查） | `CPERR_CMD` |
+| `signal_id == 0xFFFF` 或 `< 0x0100` | `CPERR_CMD` |
+| `wait_id` 同上 | `CPERR_CMD` |
+
+### 7.2 逐 opcode
+
+| opcode | 长度 | 附加约束 |
+|--------|------|----------|
+| NOP 0x00 | ≥2 | — |
+| WRITE_REG 0x01 | 4 | `w2[1:0]==0 && w2 < MMIO_END` |
+| READ_REG 0x02 | 4 | 同上；且 `w3[1:0]==0 && w3 >= MMIO_END` |
+| LOAD_KERNEL 0x03 | 5 | `w4[31:2]==0`、`w4[1:0]!=0`、`w2[1:0]==0`、`w3!=0 && w3[1:0]==0 && w3<=16KB` |
+| LAUNCH 0x04 | 5 | `w3[31:8]==0`、`1 <= w3[7:0] <= 8` |
+| FENCE 0x05 | 2 | — |
+| SIGNAL 0x06 | 4 | `w2[1:0]==0 && w2 >= MMIO_END` |
+| WAIT 0x07 | 4 | 同 SIGNAL（`w2` 是地址） |
+| IRQ 0x08 | 3 | `w2[31:8]==0`、`w2[7:0] <= 7` |
+| PARAMS 0x09 | 4+N | `w2[31:16]==0 && w3[31:16]==0`、`w2[1:0]==0 && w2[15:0]<4096`、`1<=N<=256`、`len==4+N`、`w2[15:0]+N*4<=4096` |
+| GEMM 0x18 | 16 | 见 §7.3 |
+| 2D_FILL 0x10 | 6 | — |
+| 2D_BLIT 0x11 | 9 | — |
+| 2D_DRAW 0x12 | 8 | — |
+| 2D_SET_REG 0x13 | 4 | — |
+| 2D_FLUSH 0x14 | 2 | — |
+| 0x15/0x16/0x17 | ≥2 | 只查通用头，转交 2D 引擎（参数由引擎报 `BAD_PARAM`） |
+| 0x0A-0x0F、0x19-0x7F | — | `CPERR_CMD`（保留） |
+| 0x80-0xFF | ≥2 | 合法，跳过 |
+
+### 7.3 GEMM 的结构性检查
+
+```
+len == 16
+(w2 | w3 | w4) & 0xF == 0          // word2..4 的低 4 位保留，必须为 0
+1 <= M,N,K <= 4096
+w10[31:16]==0 && w12[31:8]==0 && w13..w15==0
+dtype == 0                          // v1 只支持 INT8
+gflags[2] == 0                      // REQUANT 未实现
+gflags[7:3] == 0                    // 保留
+lda != 0 → lda >= k
+ldb != 0 → ldb >= (transB ? k : n)
+ldc != 0 → ldc >= n
+```
+
+这之后 CP 就撒手了：真正的参数合法性（例如 A/B 是否会越界）由 GEMM 引擎自己判，
+错误通过 `gemm_error` 回读，`ST_WAIT_ENG` 看到 `ERROR` 位就报 `CPERR_ENGINE_FAULT`。
+
+### 7.4 `ST_DECODE` 里额外的两道
+
+1. `WRITE_REG` 写队列配置 → 值与时机（§6.2）；
+2. `LOAD_KERNEL` 时若 `kernel_active_q`（有 kernel 在跑）→ `CPERR_ILLEGAL_STATE`：
+   正在跑的 kernel 依赖 SRAM 里的代码，不能边跑边覆盖。
+
+---
+
+## 8. 依赖与完成语义
+
+### 8.1 `wait_id`
+
+`ST_DECODE` 里若 `wait_id != SEM_NONE`：清 `poll_gap`、`timeout_cnt`，把
+`poll_addr` 指向 `sem_base + wait_id*4`、`poll_val = 1`，进 `ST_POLL`。
+判据是 `SEM[wait_id] >= 1`，即"被依赖的命令至少完成了一次"。
+
+由于 CP 是 in-order 的，`wait_id` 正常情况下不会阻塞（依赖的命令一定在前面已经做完）；
+它真正派上用场的是：**另一个 CP/另一个队列**、或 host 在两条命令之间手工清 `SEM`、
+或 SM 侧的"等我写完这里"式同步。对超时路径来说，它是唯一能让 CP 在无事可做时
+也保持可观测的机制。
+
+### 8.2 `signal_id` 与信号量 RMW
+
+一条完成态的命令若带 `signal_id`，`ST_UPD_FIN` 会分成两趟：
+
+```
+第 1 趟：发 OP_RD_WORD 读 SEM[id] → 走 ST_MEM，结果进 scratch，回 ST_SEM_WR
+第 2 趟：写 scratch+1 回去 → 走 ST_MEM，回到 ST_UPD_FIN
+         （此时 head_we 才真正拉高，HEAD 前进、清行缓存）
+```
+
+不做原子操作是安全的：只有 CP 会碰信号量（SM 侧只写自己的完成标志，不碰 SEM），
+所以"读-改-写"不存在竞争。`sig_rd_sent` 就是这个两趟的分相标志。
+
+`SEM_NONE`（`0xFFFF`）表示"这条命令不加信号量"。
+
+### 8.3 WAIT 的轮询节流
+
+`ST_POLL` 发一次读，`ST_POLL_WAIT` 判值：
+
+- 值 `>= poll_val` ⇒ 成功，清零超时计数，按 `poll_dst_upd` 去 `ST_EXEC`（WAIT 命令）
+  或 `ST_UPD_FIN`（`wait_id` 路径）；
+- 不满足 ⇒ `poll_gap = 8`；
+- 之后每个周期递减，到 0 再回 `ST_POLL` 重读。
+
+重读周期约 `8 + 一轮单字读握手（3～4 拍）≈ 10～12 拍`。节流的意义是别让 CP 拿
+轮询把内存总线占满（同一条总线上还有 SM 在取指/访存）。
+
+### 8.4 超时
+
+`timeout_cnt` 在 `ST_WAIT_SM` / `ST_WAIT_ENG` / `ST_POLL_WAIT` 里自增，
+`timeout_hit = (timeout_cnt >= timeout_cycles)`，默认 1,048,576 拍。
+超时 ⇒ `CPERR_TIMEOUT` + `ST_ERR`。
 
 ---
 
 ## 9. LOAD_KERNEL 的数据通路
 
+### 9.1 命令
+
+`w2 = src`（源地址，4B 对齐）、`w3 = size_bytes`（≤ 16KB，4B 倍数，非 0）、
+`w4[1:0] = sm_mask`（装给哪些 SM）。
+
+### 9.2 镜像头（前 32B = 8 字）
+
+| 字 | 含义 | RTL 校验 |
+|----|------|----------|
+| w0 | magic | `== 0x5347_4B31`（"SGK1"） |
+| w1 | `entry_off` | 4B 对齐、`>= 32`、`<= size` |
+| w2 | `size_bytes` | `== w3`（命令里的 size） |
+| w3 | `flags` | 不校验；`LAUNCH` 时用来和命令的 `kernel_flags` 逐位比对 |
+| w4 | `crc32` | 必须等于流式计算值 |
+| w5 | `payload_bytes` | `== size - entry_off` |
+| w6/w7 | 保留 | `== 0` |
+
+### 9.3 流式装载
+
+`ST_LOADK`（`cp.sv:848`）逐字：
+
+1. 从行缓存（必要时读内存）取第 `idx` 个源字；
+2. 写指令 SRAM：`sram_load_en = {2{sram_en_q}} & load_sm_mask`、
+   `addr = idx`、`last = (idx == words-1)`，两个 SM 各一份独立口；
+3. 前 8 字顺手存进 `img_hdr[0:7]`；
+4. 从 `idx*4 >= entry_off` 开始把字喂给 `crc32_word`（`crc_en`），
+   所以 CRC 只覆盖**指令区**，不含镜像头；
+5. `idx` 走到 `words` 后进 `ST_LOADK_ND`。
+
+`ST_LOADK_ND`（`cp.sv:872`）：
+
+- `|sram_err_ovf` ⇒ `CPERR_CMD`（写超过 16KB）；
+- 等 `|(sram_load_done & load_sm_mask)` 全高；
+- 校验 §9.2 全部字段 + CRC；
+- 全过 ⇒ `img_we = 1`，寄存器文件里置 `SM_KERNEL_MASK |= sm_mask` 并记下
+  `entry_off/size/flags`。
+
+失败则 `CPERR_CMD` 停机 —— 注意此时 SRAM 里可能已经写了一半垃圾，但
+`SM_KERNEL_MASK` 没置，`LAUNCH` 会被拒绝，所以是安全的。
+
+---
+
+## 10. LAUNCH 与 SM 协作
+
+### 10.1 九条前置
+
+第 0 条在 `cmd_decode.sv`，第 1～6 条在 `cp.sv:264` 的 `launch_check` 里
+（下面列的顺序就是代码里的判断顺序），第 7～8 条不是 RTL 检查项：
+
+0. 长度 5、`w3[31:8]==0`、`1<=num_warps<=8`（`cmd_decode`）；
+1. **涉及 SM 的 `SM*_ERROR == 0`**（`CPERR_STALE_SM_ERROR`）—— 必须最先判；
+2. `kernel_pc[1:0]==0`；
+3. `kernel_pc < img_size`（按目标 SM 逐个查）；
+4. `SM_KERNEL_MASK & sm_mask == sm_mask`（涉及的 SM 都装过镜像）；
+5. `kernel_flags[3:0]` 与镜像头 flags 逐位一致；
+6. 若 `kernel_flags` 的 `USES_BARRIER / USES_SHARED / REQUIRES_SINGLE_SM` 任一为 1，
+   而 `num_warps > 4`（会跨 SM）⇒ `CPERR_LAUNCH_REJECT`；
+7. 下面几条是驱动契约、RTL 不校验：常量区已由 `PARAMS` 装好、SM0 的参数区指针
+   已写对（SM 从固定地址 0 读）、要写的 buffer 已在常量区；
+8. `wait_id` 已在 `ST_DECODE` 查过。
+
+顺序不能交换：kernel 死在前一个错误上时，再去讨论 `num_warps`/`pc`/`flags`
+只会掩盖真正的原因。
+
+### 10.2 分发
+
+`sm_sel = (num_warps > 4) ? 2'b11 : 2'b01`（`cp.sv:296`）：
+
+- `num_warps ∈ [1,4]`：只给 SM0，SM0 拿全部 `num_warps`；
+- `num_warps ∈ [5,8]`：两个 SM 各拿 4 个，warp 0-3 落 SM0、4-7 落 SM1。
+
+`ST_LAUNCH` 那一拍 `sm_launch_valid = sm_sel_q`（组合），SM 侧 `fetch.sv:168`
+就在这一拍把 `pc ← launch_pc`。CP 只发 `num_warps`，**不**重复 ISA §2.2 的
+"warp 槽位"放置逻辑（那是 SM 自己的事，`core.sv:366` 里
+`launch && (W < launch_warps)`）。
+
+### 10.3 完成
+
+- `SM_DONE` 由分发那一拍负责清零（`launch` 脉冲承担），否则第二个 kernel 会
+  立刻"完成"；
+- `(sm_done & sm_sel_q) == sm_sel_q` ⇒ 涉及的 SM 全 DONE ⇒ `ev_launch_done`、
+  恢复 `kernel_active_q=0`，进收尾；
+- 任一涉及 SM 报错 ⇒ `CPERR_SM_FAULT` 停机，**不写信号量** —— host 靠
+  "SEM 不增长 + `CP_ERROR` 有值"区分"失败"与"还在跑"。
+
+---
+
+## 11. 引擎路径（GEMM / 2D）
+
+`ST_ENG_SEND`（`cp.sv:938`）是两段式：
+
 ```
-DMA 读(64B 突发) ──► 镜像头校验(前 32B) ──► 指令 SRAM 预加载口(广播到 sm_mask)
-                        │                        │
-                        │                        └─► CRC32 流水(1 字/拍)
-                        └─► 记 {entry_off, image_flags, image_size}
-完成 ⇒ 比 code_crc32 与流式算出的值 ⇒ 一致才置 SM_KERNEL_MASK 对应位
+eng_valid  ▔╲________                        命令头一拍
+eng_wvalid ______▔▔▔▔▔▔▔▔▔▔╲__               payload 逐字，eng_ready 背压
+eng_wlast  ______________▔╲___               最后一个字
+eng_ready  ▔▔▔▔▔╲▔▔╲▔▔╲▔▔╲▔▔               CP 只在 ready 时前进
 ```
 
-- **镜像头**(CMDS §6.4):magic `0x5347_4B31`、`entry_off`、`image_size`、`image_flags`、`code_crc32`、`code_size`、保留字必须 0。
-- **CRC-32/ISO-HDLC**(poly `0xEDB88320`,初值/末值取反,与 `zlib.crc32` 一致):用一个 32b LFSR 单元边流边算,覆盖**指令区**(`entry_off` 起 `code_size` 字节)。
-- **`err_ovf` 自检**:CP 已经保证 `size ≤ 16KB` 且 `entry_off < size`,所以 `instr_mem` 的 `err_ovf` 正常永不响;响了就是实现 bug ⇒ 归到 `CMD_ERROR`(不静默)。
-- **前置状态检查**:`CP BUSY`(有 kernel 在跑)时执行 `LOAD_KERNEL` ⇒ `ILLEGAL_STATE`(§6.4)。
-- 失败时**不留半成品**:`SM_KERNEL_MASK` 只在全部校验通过后才置位;已经写进 SRAM 的半份镜像无害(LAUNCH 会让它重新加载),但要保证 `SM_KERNEL_MASK=0`。
+- payload 长度 = `length_words - 2`，数据来自 `cmd_w[idx+2]`；
+- `2D_FLUSH` 这类 payload 为 0 的命令：头推完直接进 `ST_WAIT_ENG`；
+- `ST_WAIT_ENG` 等 `status[DONE] && !status[BUSY]`；`status[ERROR]` ⇒
+  `CPERR_ENGINE_FAULT`。错误码在 `gemm_error` / `2d_error` 里，CP 不解释。
+
+引擎忙（`eng_ready=0`）时 CP 就停在这里 —— 这是背压，不是丢命令。
 
 ---
 
-## 10. 引擎分发(2D / GEMM)
+## 12. MMIO 寄存器表
 
-- **CP 的义务**只有"长度/保留位校验 + 原样转交"(§6.9/§12):参数含义、几何、格式都是引擎的事。
-- 分发:`eng_valid/opcode/len` + payload 流 + `eng_ready` 背压;引擎忙时 CP 停在 `X_STREAM`(不丢命令)。
-- 完成:引擎 `DONE && !BUSY && !ERROR`;完成且无错 ⇒ `SEM[signal_id] += 1` + `IRQ_2D_DONE`/`IRQ_GEMM_DONE`。
-- 出错:引擎 `ERROR` ⇒ `CP_ERROR = ENGINE_FAULT(=8)`,**不写信号量**,细节看 `2D_ERROR`/`GEMM_ERROR`。
-- `2D_STATUS`/`GEMM_STATUS`/`CP_STATUS` 的位定义:`{ERROR, DONE, BUSY}`(CMDS §7/§6.11、GFX §7.2)。
-- **引擎未实现的取值**(`dtype != 0`、`REQUANT`、保留 opcode)一律 `CMD_ERROR` 而不是静默忽略(§2.4/§6.11)。
+基址 `0x0000_0000`，窗口 4KB。属性列含义：`R` 可读、`W` 任一访问口都能写、
+`命令W` 命令与 host 都能写、`host W` **只有 host 直写有效**（命令写能过白名单但
+不产生效果，见 §15.2 第 5 条）。
+
+| 偏移 | 名称 | 属性 | 复位值 | 说明 |
+|------|------|------|--------|------|
+| 0x00 | `CP_STATUS` | R | — | `bit0=IDLE`、`bit1=BUSY`、`bit2=ERROR`（`cp_regs.sv:122`） |
+| 0x04 | `CP_ERROR` | R/命令W/host W | 0 | 8 位错误码；**写任意值清零**；首错保留 |
+| 0x08 | `CMD_HEAD` | R/host W | `QUEUE_BASE_DEF` | CP 推进；host 写需在 `[base,base+size)` 且 4B 对齐 |
+| 0x0c | `CMD_TAIL` | R/W | `QUEUE_BASE_DEF` | host 推进发布命令 |
+| 0x10 | `DOORBELL` | host W | — | 写任意值置 pending（读恒 0）；命令路径无效，见 §15.2 |
+| 0x14 | `IRQ_STATUS` | R/命令W/host W | 0 | 5 位在用；写任意值清零 |
+| 0x18 | `IRQ_ENABLE` | R/W | 0 | 中断使能；`irq` 是 status 与 enable 相与后的归约或 |
+| 0x1c | `SM_DONE` | R | — | 每 SM 一位 |
+| 0x20 | `SM0_ERROR` | R/host W | — | 写即清（数据忽略，`sm_err_clr[0]`） |
+| 0x24 | `SM1_ERROR` | R/host W | — | 写即清（数据忽略，`sm_err_clr[1]`） |
+| 0x28 | `SEM_BASE` | R/W | `0x0300_0000` | 信号量数组基址 |
+| 0x2c | `CMD_QUEUE_BASE` | R/命令W/host W | `0x0100_0000` | 写合法值同时把 `HEAD=TAIL=新值`；host 写受 `idle_i` 门控 |
+| 0x30 | `CMD_QUEUE_SIZE` | R/命令W/host W | 4096 | `>=8` 且 8 的倍数；写合法值同时 `HEAD=TAIL=queue_base` |
+| 0x34 | `CONST_BASE` | R | `0x0200_0000` | 常量，不可写 |
+| 0x38 | `FB_BASE` | R/W | `0x1000_0000` | 帧缓冲基址 |
+| 0x3c | `DDR_BASE` | R | `0x8000_0000` | 常量，不可写 |
+| 0x40 | `CP_RESET` | host W | — | 写 bit0 ⇒ 软复位（§13.3）；命令路径无效，见 §15.2 |
+| 0x44 | `TIMEOUT_CYCLES` | R/W | `0x0010_0000` | 写 0 恢复默认值 |
+| 0x48 | `SM_KERNEL_MASK` | R | 0 | `LOAD_KERNEL` 成功时按 `sm_mask` 置位；`CP_RESET` 清 |
+| 0x4c | `SM0_FAULT_PC` | R | — | SM0 出错 PC 透传 |
+| 0x50 | `SM1_FAULT_PC` | R | — | SM1 出错 PC 透传 |
+| 0x60 | `GEMM_STATUS` | R | — | `bit0=BUSY,1=DONE,2=ERROR` |
+| 0x64 | `GEMM_ERROR` | R/host W | — | 写即清（数据忽略，`eng_err_clr[0]`） |
+| 0x68 | `2D_STATUS` | R | — | 同 GEMM |
+| 0x6c | `2D_ERROR` | R/host W | — | 写即清（数据忽略，`eng_err_clr[1]`） |
+
+未列出的偏移读回 0、写被忽略（`cp_regs.sv:147` 的 `default`）。
+
+`WRITE_REG` 命令的白名单是 `cp_regs.sv:109` 列出的 15 个偏移；不在这 15 个里的
+地址 ⇒ `CPERR_CMD`。这 15 个里真正能靠命令改到寄存器值的只有 9 个
+（`CP_ERROR` / `IRQ_STATUS` / `IRQ_ENABLE` / `CMD_TAIL` / `SEM_BASE` / `FB_BASE` /
+`TIMEOUT_CYCLES` / `CMD_QUEUE_BASE` / `CMD_QUEUE_SIZE`），另外 6 个
+（`DOORBELL` / `CP_RESET` / `SM0_ERROR` / `SM1_ERROR` / `GEMM_ERROR` / `2D_ERROR`）
+的事件或清零信号只由 host 访问触发 —— 见 §15.2 第 5 条。
 
 ---
 
-## 11. MMIO 寄存器文件(`cp_regs.sv`,CMDS §7 全表)
+## 13. 错误模型与恢复
 
-| 偏移 | 名称 | 读 | 写 | 复位值 |
-|---|---|---|---|---|
-| 0x00 | `CP_STATUS` | `{ERROR,BUSY,IDLE}` | — | `0x1`(IDLE) |
-| 0x04 | `CP_ERROR` | 首个错误码 | 写任意值清零 | 0 |
-| 0x08 | `CMD_HEAD` | `head` | **只有 host 能写**(`WRITE_REG` 写它 ⇒ `CMD_ERROR`,`chk_wr_ok` 里没有它)做异常恢复;限 `[base, base+size)` **且 4B 对齐**,否则丢弃该写、保持原值 | `=base` |
-| 0x0C | `CMD_TAIL` | `tail` | 驱动写 | `=base` |
-| 0x10 | `DOORBELL` | 0 | 写任意值 ⇒ 置内部 pending 位 | — |
-| 0x14 | `IRQ_STATUS` | 中断位图 | 写任意值清零 | 0 |
-| 0x18 | `IRQ_ENABLE` | 使能位图 | R/W | 0 |
-| 0x1C | `SM_DONE` | `{sm_done[1:0]}` | — | — |
-| 0x20/0x24 | `SM0/1_ERROR` | SM 错误码 | 写任意值清零(经 SM 侧复位线) | 0 |
-| 0x28 | `SEM_BASE` | R/W | 写 | `0x0300_0000` |
-| 0x2C | `CMD_QUEUE_BASE` | R/W | 写(须 4B 对齐且 ≥ `MMIO_END`;非法值忽略、仅在 IDLE 可写;写后 `head=tail=新基址`) | `0x0100_0000` |
-| 0x30 | `CMD_QUEUE_SIZE` | R/W | 写(须 ≥8 且 8 的倍数;非法值忽略、仅在 IDLE 可写) | 4096 |
-| 0x34 | `CONST_BASE` | 只读 `0x0200_0000` | — | — |
-| 0x38 | `FB_BASE` | R/W | 写 | `0x1000_0000` |
-| 0x3C | `DDR_BASE` | 只读 `0x8000_0000` | — | — |
-| 0x40 | `CP_RESET` | 0 | 写 1 ⇒ CP_RESET 序列(§7.3) | — |
-| 0x44 | `TIMEOUT_CYCLES` | R/W | 写(0 ⇒ 回默认 `0x10_0000`) | `0x10_0000` |
-| 0x48 | `SM_KERNEL_MASK` | `{sm0,sm1}` | — | 0 |
-| 0x4C/0x50 | `SM0/1_FAULT_PC` | 透传 SM | — | 0 |
-| 0x60/0x64 | `GEMM_STATUS`/`GEMM_ERROR` | 透传引擎 | `GEMM_ERROR` 写清零 | 0 |
-| 0x68/0x6C | `2D_STATUS`/`2D_ERROR` | 透传引擎 | `2D_ERROR` 写清零 | 0 |
+### 13.1 八种错误（`cp_pkg.sv`）
 
-三条实现约定:
+| 码 | 名称 | 典型来源 |
+|----|------|----------|
+| 0 | `CPERR_NONE` | — |
+| 1 | `CPERR_CMD` | 长度/保留位/对齐/窗口/镜像头/CRC 不合法 |
+| 2 | `CPERR_LAUNCH_REJECT` | 单 SM 语义的 kernel 却要求跨 SM |
+| 3 | `CPERR_BUS` | 内存口回 `err` |
+| 4 | `CPERR_TIMEOUT` | 等 SM / 等引擎 / 轮询超时 |
+| 5 | `CPERR_ILLEGAL_STATE` | 队列配置不是最后一条 / kernel 跑着时装镜像 |
+| 6 | `CPERR_STALE_SM_ERROR` | 目标 SM 还挂着上一次的错误 |
+| 7 | `CPERR_SM_FAULT` | kernel 跑挂了 |
+| 8 | `CPERR_ENGINE_FAULT` | 2D/GEMM 报错 |
 
-1. **错误寄存器是"值编码 + 写任意值清零"**,不是 W1C 位图(CMDS §7 的 v0.2 修正);
-2. **首个错误保留**:`cp_err.sv` 只在 `CP_ERROR == 0` 时写入新错误(`cp.cpp:60-70`);
-3. `CP_STATUS` 的精确定义(与模型 `cp.cpp:89-95` 一致):
-   `IDLE = (queued==0 && !work_in_progress && !error)`,`BUSY = (queued!=0 || work_in_progress)`,`ERROR = error_latched`。
+### 13.2 首错保留
 
-### 11.1 MMIO 访问结构:一份状态,两个访问口
+`cp_regs` 里 `if (cp_err_we && cp_error == CPERR_NONE) cp_error <= cp_err_wdata`
+（`cp_regs.sv:194`）—— 只有第一个错误能写进去，后续都被忽略。配合"失败不推进
+HEAD"，`CP_ERROR` + `CMD_HEAD` 两个寄存器就能定位到出错的命令。
+
+### 13.3 `CP_RESET` 到底重置什么
+
+写 `CP_RESET[0]=1` 时（`cp_regs.sv:243`）：
+
+- `HEAD <= TAIL`（丢弃队列里剩余命令，不阻塞 host 继续用）
+- `CP_ERROR <= 0`、`IRQ_STATUS <= 0`
+- `SM_KERNEL_MASK <= 0`（之后的 `LAUNCH` 会被拒绝，直到重新 `LOAD_KERNEL`）
+- `doorbell_pend <= 0`
+
+**不**清：`QUEUE_BASE/SIZE`、`SEM_BASE`、`FB_BASE`、`TIMEOUT_CYCLES`、各 SM 的
+`img_entry/size/flags`（它们已被 `KERNEL_MASK` 屏蔽）、`IRQ_ENABLE`。
+
+状态机侧同时回 `ST_IDLE`、清 `mop/req_sent/line_valid/kernel_active_q/timeout_cnt`
+（`cp.sv:549`）。注意它**不会**清 `ST_ERR` 里已经锁死的 `CP_ERROR` 之外的任何东西 ——
+复位之后 SM 的 `SM*_ERROR` 仍在，必须单独写一次清零，否则下一次 `LAUNCH`
+会得到 `CPERR_STALE_SM_ERROR`。这是设计意图（错误现场保留）。
+
+---
+
+## 14. 时序与性能备忘
+
+单条命令的周期数 = `取命令` + `执行` + `收尾`：
+
+| 阶段 | 周期 | 备注 |
+|------|------|------|
+| `ST_IDLE→LOADW` | 1 | 空队列敲门是 0 |
+| 取 word0/word1 | 2（命令缓存命中）/ +两段 8 拍突发 | 缓存未命中才走内存；见 §2.3 |
+| 补命令体 | `len-2`（行命中） | 每字 1 拍 |
+| `ST_DECODE` | 1 | |
+| `ST_EXEC` | 1 | |
+| 内存操作 | 3～5（单字读）/ 5～7（单字写） | 读: req→ack→一拍数据；写: req→ack→完成应答 |
+| `ST_UPD_FIN` | 1（无信号量）/ +6～8（有信号量） | |
+| 行未命中的惩罚 | +20～22 | 16 拍数据 + 回话一拍 + 握手；`cmd_cache` 命中后这条基本消失(命令环 4KB 全驻留)，并靠顺序预取摊薄 |
+
+所以：2 字 NOP 约 7 拍，5 字命令约 10 拍（都是命令缓存命中口径；未命中再 +18～20）；
+整套 `sim/run-sim` 上实测(4 warp)：clear 1240 拍、gouraud 6098 拍、matmul 156234 拍、
+anim 每帧 14851 拍。`LOAD_KERNEL` 每字约 2～3 拍
+（读行 + 写 SRAM + CRC 三件事并行）；`PARAMS` 每字 4～5 拍（一次写握手）；轮询空转
+每 10～12 拍一次内存读。
+
+---
+
+## 15. 已知差异、坑与注意事项
+
+### 15.1 与参考模型的差异（有意为之）
+
+| 行为 | 参考模型 | RTL |
+|------|----------|-----|
+| WAIT 超时 | 立刻 `TIMEOUT` | 真的等 `TIMEOUT_CYCLES` |
+| FENCE | 空操作 | 空操作（语义已由 in-order 覆盖） |
+| LOAD_KERNEL | 先把镜像读进缓冲再算 CRC | 边流边算，不缓冲（省 BRAM） |
+
+### 15.2 五个必须知道的实现细节
+
+1. **行缓冲必须每条命令清零。** 有人觉得"跨命令复用会更省"，那是错的：host 可以
+   搬回 `HEAD` 重写已消费区域，缓存会读到旧字节。
+2. **`next_head_raw`（未回绕值）同时用于三个判断。** 改成用回绕后的 `next_head`
+   去比 `tail` 会把"命令正好结束在环末尾"判错。
+3. **`ST_MEM` 里 `mop` / `op_is_rd` 用的是本拍旧值。** 因为 `mop <= OP_NONE`
+   是非阻塞赋值。往这个块里加逻辑时不要以为 `mop` 已经变了。
+4. **空队列敲门会被消费掉。** `doorbell_pend` 是电平位而不是计数器：host 在 CP
+   忙时敲 10 次，CP 只看到一次。命令是否该执行由 `head != tail` 决定，所以这不影响
+   正确性，但"敲门次数"没有意义。
+5. **6 个偏移"命令写能过校验但不生效"。** `cp_regs.sv:109` 的 `chk_wr_ok` 白名单
+   收了 `DOORBELL` / `CP_RESET` / `SM0_ERROR` / `SM1_ERROR` / `GEMM_ERROR` /
+   `2D_ERROR`，但这几个的动作信号（`doorbell_evt`、`cp_reset_evt`、`sm_err_clr`、
+   `eng_err_clr`）全部由 **host 直写**的 `ext_wr_en` 触发（`cp_regs.sv:253-260`），
+   而主写 `case` 里没有它们的条目 —— 所以 `WRITE_REG` 命令写这 6 个地址只会
+   "什么都不发生"（既不报错也不生效）。要复位/敲门/清错误现场，只能由 host 直接写
+   这些寄存器。反过来，`WRITE_REG` 命令也不能用来敲 `DOORBELL` 自杀式连发命令 ——
+   这是当前实现的确定性行为，改的话要同时动 `chk_wr_ok` 和事件产生逻辑。
+
+### 15.3 顶层示例里的接线（`sim/run-sim/rtl/gpu_system.sv`）
+
+- `eng_ready` / `gemm_status` / `gemm_error` / `twod_status` / `twod_error` 被
+  `` `ZERO_PIN `` 接 0（该示例没接引擎）。所以任何 `GEMM` / `2D_*` 命令都会卡在
+  `ST_ENG_SEND` 直到 `TIMEOUT`，这是**预期**行为，不是 CP 死锁。要测引擎路径得把
+  这五个信号接到真的引擎，或者接一个最小桩（`eng_ready=1`、`status` 在 payload
+  收完后置 `DONE`）。
+- SM 侧接线是对的：`u_core0 → cp_sm0_{error,fault_pc}`、`u_core1 →
+  cp_sm1_{error,fault_pc}`，`sm_done[0]/[1]` 分别回 CP。该文件当前有未提交改动
+  （`git status` 里的 `M`），核对接线时以 working tree 为准。
+
+### 15.4 与旧版 cp.md 的勘误
+
+| 旧文档说 | 实际 |
+|----------|------|
+| 模块拆分 `cp_fsm.sv / cmd_fetch.sv / kernel_loader.sv / sem_unit.sv / launch_unit.sv / engine_unit.sv / cp_err.sv` | 只有 `cp.sv` + `cp_regs.sv` + `cmd_decode.sv` + `axil_slave.sv` + `crc32_word.sv` |
+| `ST_PARAMS_RET`、`ST_LENCHK`、`ST_UPD` 等状态 | 不存在；`ST_PARAMS` 直接回自己，长度检查合在 `ST_LOADW`，`ST_UPD_FIN` 就是收尾 |
+| "21 个状态" | 18 个（`cp.sv:150`） |
+| 信号名 `s_axil_*`、`eng_error_ext` | 实际是 `s_aw*` / `s_w*` / `s_ar*` / `s_r*`，引擎错误走 `gemm_error` / `2d_error` |
+| WAIT 只要求地址对齐 | 还要求 `>= MMIO_END`（`cmd_decode.sv:109`） |
+
+---
+
+## 16. 验证
+
+### 16.1 用例清单（`tb/tests/cp/test_cp.py`，15 个）
+
+| 用例 | 覆盖 |
+|------|------|
+| `test_mmio_registers` | 全部寄存器读写、复位值、`CP_STATUS` 位 |
+| `test_nop_walk_and_irq_flag` | 纯 NOP 队列走完、`CMD_DONE` 位 |
+| `test_signal_wait_readreg_irq_fence` | SIGNAL / WAIT / READ_REG / IRQ / FENCE |
+| `test_params_writes_constant_region` | PARAMS 落常量区、长参数（>16 字） |
+| `test_queue_boundary_errors` | 长度 <2、跨环末尾、越过 TAIL |
+| `test_queue_cfg_rules` | `QUEUE_BASE/SIZE` 的值与时机两道门 |
+| `test_wait_timeout_and_wait_id` | WAIT 超时、`wait_id` 放行 |
+| `test_load_kernel_and_launch` | 装镜像 → 分发 → 完成 |
+| `test_load_kernel_crc_and_flag_checks` | magic / size / CRC / 保留位 / flags 不符 |
+| `test_launch_reject_and_stale_sm_error` | 跨 SM 拒绝、SM 残留错误 |
+| `test_sm_fault_does_not_signal` | SM 报错 ⇒ 不加信号量 |
+| `test_gemm_and_2d_dispatch` | 引擎 payload 逐字、`2D_FLUSH` 零 payload |
+| `test_engine_fault_does_not_signal` | 引擎报错 ⇒ 不加信号量 |
+| `test_cp_reset_semantics` | `CP_RESET` 六件事、不清的项 |
+| `test_bus_error_on_queue_read` | 内存口 `err` ⇒ `CPERR_BUS` |
+
+`test_crc32.py` 用 zlib 交叉验证 `crc32_word`。
+
+### 16.2 怎么跑
+
+```bash
+# 1) 静态检查(整颗 SoC, -Wall)
+make -C sim/run-sim lint
+
+# 2) CP 的 cocotb 用例(15 个)
+make -C tb dut DUT=cp                 # 或 make -C tb test 跑全部 DUT
+make -C tb dut DUT=cp TEST=test_nop   # 只跑名字匹配的用例
+make -C tb waves DUT=cp               # 带波形
+make -C tb dut DUT=crc32_word         # 单独验证 CRC32
+
+# 3) 顶层整机 demo(不是 CP 的单元测试)
+make -C sim/run-sim run
+make -C sim/run-sim check             # 跑 clear/gouraud/matmul/anim 四个 demo
+```
+
+`make -C tb list` 可以看到注册的 DUT 列表，CP 相关的有两个：`cp`（顶层状态机）
+与 `crc32_word`。
+
+---
+
+## 17. 调试检查单
+
+CP 卡住时按这个顺序看：
+
+| 现象 | 先看 | 再想 |
+|------|------|------|
+| `BUSY=1` 但 `HEAD` 不动 | `CP_ERROR` | 有值 ⇒ 看 §13.1 对应码；为 0 ⇒ 看 `CP_STATUS` 是否卡在 `ST_ERR` 之前的等待 |
+| `BUSY=1`、无错误、一直等 | 波形里 `cp_state` | `ST_WAIT_SM`⇒SM 没完成/`SM_DONE` 没接对；`ST_WAIT_ENG`⇒`eng_ready/status` 接法；`ST_POLL_WAIT`⇒值永远不够 |
+| `BUSY=0` 且 `IDLE=0` | `CP_ERROR` | 这一组合只可能是“有错误”：停机后只有 `CP_RESET` 能出去 |
+| 命令"没执行" | `CMD_HEAD` vs `CMD_TAIL` | 相等 ⇒ host 没写 TAIL 或没敲门；不等 ⇒ CP 卡在前一条 |
+| `LAUNCH` 报 `STALE_SM_ERROR` | `SM0/1_ERROR` | 上一次错误没清（`CP_RESET` 不清它，要单独写回读寄存器） |
+| `LOAD_KERNEL` 报 `CMD` | 镜像头 8 字 + CRC | 特别是 `w2 == size`、`w5 == size-entry`、CRC 只覆盖 `entry_off` 起 |
+| 引擎命令必超时 | `eng_ready` | 顶层可能是 `ZERO_PIN`（§15.3） |
+
+---
+
+## 附:一页速查
 
 ```
-                        ┌─────────────────────── cp 内部 ───────────────────────┐
-   host / 其它单元 ──AXI4-Lite──► axil_slave ──►│  cp_regs(唯一的寄存器副本)  │◄── 直连线 ── cp_fsm
-                        └───────▼───────────────┴──────────────▲───────────────┘
-                                                               │ 每拍可读可写
-   全局内存(命令环/镜像/常量区/信号量) ◄──AXI4 主口── cp 的 DMA 引擎(64B 突发)
+命令环: head/tail 相等=空; 命令不跨环末尾; HEAD 只在完成后前进
+取指  : 64B 行缓冲(16 字), 每条命令清零
+校验  : cmd_decode(长度/保留位/对齐/窗口) + ST_DECODE(队列配置时机/缺镜像/LAUNCH 六条)
+执行  : 自己做的有 NOP FENCE READ_REG WRITE_REG SIGNAL WAIT IRQ PARAMS
+        分发出去的有 LAUNCH -> SM0/SM1, GEMM/2D -> 引擎
+同步  : signal_id => SEM[id]+=1(RMW 两趟); wait_id => SEM[wait_id]!=0 才放行
+错误  : 首错保留 + 停机, 只认 CP_RESET; 失败不推进 HEAD 不加信号量
+超时  : 所有等待态共享 TIMEOUT_CYCLES(默认 1M 拍)
 ```
-
-- **寄存器文件(`cp_regs.sv`)是唯一副本**,CP 的状态机通过**直连线**读写它(零延迟、每拍可见);
-  host 与其它单元经 `mmio_req/rsp` 这条 AXI4-Lite 从口访问**同一个**文件。**禁止影子副本** ——
-  "CP 里一份、总线上又一份"必然出现"host 改了 `CMD_TAIL`、CP 还在读旧值"这类只在并发下暴露的错。
-- 谁是拥有者就由谁存(契约 6):`SM*_ERROR`/`SM*_FAULT_PC` 在 SM,`2D_*`/`GEMM_*` 在引擎,CP 只**转发**到读口;
-  host 的"写任意值清零"由 CP 译码后**扇出**到拥有者(需要 `sm_err_clr[1:0]`、`eng_err_clr[1:0]` 两根脉冲线)。
-- **两类共享寄存器的 RTL 写法**(两处最容易出错的地方):
-  | 寄存器 | 谁写 | RTL 结构 |
-  |---|---|---|
-  | `CMD_HEAD` | CP 推进 + host 异常恢复 | 两个写源,**CP 的推进优先级更高**;host 写在 CP 忙时丢弃(或按 §2.1 拒绝) |
-  | `CMD_TAIL` / `IRQ_ENABLE` / `SEM_BASE` / `QUEUE_*` / `TIMEOUT_CYCLES` | host(或 `WRITE_REG` 命令) | 纯外部写、CP 只读;`QUEUE_*` 再叠一条"仅 IDLE 且队列空才允许改"的门 |
-  | `CP_ERROR` / `IRQ_STATUS` | CP 置位、host 写清零 | 置位与清零分两条路径;`CP_ERROR` 加**首个错误保留**门(§12) |
-  | `DOORBELL` / `CP_RESET` | host 写 | **边沿事件**,不是电平:写任意值 ⇒ 置一个内部 pending 位,由 CP 消费/自清(防止"CP 忙时敲门丢了") |
-- **哪些东西**必须**留在主口(不能内部化)**:命令环、内核镜像、常量区、信号量 —— 它们物理上在**全局内存**里,
-  只能走 `dma_req/rsp`。这里才是真正值得优化带宽的地方:64B 突发(§6/§13)。
-- **效率账(为什么"效率低下"不是这里的理由)**:每帧的 MMIO 访问是**十几次**(写 `CMD_TAIL`、`DOORBELL`、
-  清错误、偶尔读状态),每次 AXI4-Lite 往返 ≈ 10~20 拍 ⇒ **一二百拍/帧**;而一帧的 kernel 时间是**数万拍**
-  (ISA §8.1 的实测:clear 4179 拍、matmul 12716 拍)。也就是说 MMIO 占比 < 1%,**改不改都不会更快**。
-  真正值得做的是:① 寄存器内部直连(省掉状态机的等待,这是**正确性与简洁性**问题,不是带宽问题);
-  ② 命令环/镜像/信号量走 64B 突发(这才是带宽问题)。
-
-> 另一个常被顺手提出、但应当**拒绝**的做法:给常用寄存器做"影子副本 + 同步逻辑"(例如 CP 内部再存一份
-> `TAIL` 的镜像,由 host 写的时候更新)。多一份就多一处不一致;本设计统一按"一份状态 + 两个访问口"。
-
----
-
-## 12. 错误与恢复
-
-| CP 错误(§8.1) | 触发 | 停机后 |
-|---|---|---|
-| 1 `CMD_ERROR` | 长度/保留位/镜像头/CRC/参数越界/未实现取值 | 锁存,等 `CP_RESET` |
-| 2 `LAUNCH_REJECT` | flags 与 `num_warps ≥ 5` 冲突 | 同上 |
-| 3 `BUS_ERROR` | 命令环读 / 镜像读 / `READ_REG` 落地写 / 信号量读写 的 AXI 错误响应 | 同上 |
-| 4 `TIMEOUT` | 等 `SM_DONE`/引擎/信号量 超 `TIMEOUT_CYCLES` | 同上 |
-| 5 `ILLEGAL_STATE` | BUSY 时 `LOAD_KERNEL`;IDLE+队列非空时改 `CMD_QUEUE_*` | 同上 |
-| 6 `STALE_SM_ERROR` | LAUNCH 时涉及 SM 仍有未清错误 | 同上 |
-| 7 `SM_FAULT` | 任一涉及 SM `sm_error != 0` ⇒ kernel 失败、**不写信号量** | 同上 |
-| 8 `ENGINE_FAULT` | 2D/GEMM 引擎报错 | 同上 |
-
-**恢复路径**(§7.3,固定顺序):`CP_RESET` → 读 `SM*_ERROR`/`SM*_FAULT_PC`/`CP_ERROR` 定位 → `LOAD_KERNEL` → 重新提交。
-
-`CP_RESET` 的六件事(§7.3 逐条):① 状态机回 IDLE;② 清 `CP_ERROR`/`IRQ_STATUS`、`HEAD ← TAIL`;
-③ 清 SM 错误/FAULT_PC/`warp_alive`;④ 清 `SM_KERNEL_MASK`(镜像失效);
-⑤ 复位引擎(丢弃未完成的 GEMM/2D 命令与 2D 寄存器);⑥ **保持** `CMD_QUEUE_*`/`SEM_BASE`/`FB_BASE` 不变。
-第六项是"方便重新提交"的关键,不要一复位就把配置也清了。
-
----
-
-## 13. 与参考模型的三处已知差异(必须在 RTL 里写清楚)
-
-| # | 参考模型 | RTL 应该怎么做 | 为什么要写下来 |
-|---|---|---|---|
-| 1 | `WAIT`/`wait_id` 不满足时**立刻**报 `TIMEOUT`(`cp.cpp:379-382`),理由是"模拟器单点顺序执行,没有别的执行体能推进它" | RTL **真的等待**(kernel 与引擎在并发跑),超时靠 `TIMEOUT_CYCLES` | 这是模型的**实现取舍**,不是架构语义;照抄会让 RTL 在正常并发场景下误报超时 |
-| 2 | 全局写"直达内存",`FENCE` 是空操作 | `FENCE` 等自身未完成写落地即可(前置命令已完成 ⇒ SM 的 WCB 已冲刷) | 语义一致,但理由不同(ISA §2.5 的 `exit` 已负责冲刷) |
-| 3 | `LOAD_KERNEL` 一次读完整镜像再校验 CRC(内存里 buf) | **边流边算 CRC**,不缓冲整份镜像 | 16KB 缓冲不值得;CRC 流水是 1 字/拍的等价实现 |
-
----
-
-## 14. 实现决策(均已落地)
-
-| # | 决策 | 结论 | 理由 |
-|---|---|---|---|
-| D1 | MMIO Lite 从口放哪 | **放 CP**(它是寄存器的唯一拥有者) | 省掉一层"Lite → 内部寄存器总线"的转发;SPEC §3.1/§3.4 已按此写 |
-| D2 | 命令取指粒度 | **64B 行缓冲 + 落不下时退化逐字读** | 快路径 1 次突发;退化路径保证不依赖驱动的填充行为 |
-| D3 | `LOAD_KERNEL` 写两个 SM | **读一份、广播两份** | 省一半 DMA 带宽;依赖 `instr_mem` 的两个独立预加载口(已有) |
-| D4 | CRC32 | **专用 LFSR 单元,流式 1 字/拍** | 不需要缓冲整份镜像 |
-| D5 | `wait_id` 的比较值 | **`SEM[id] != 0`**(与参考模型一致) | 判据已回填到 CMDS §10.2 |
-| D6 | 等待/轮询策略 | `wait_id` 在分发前查一次;**`WAIT` 命令每 8 拍轮询**;超时按"总等待周期"计 | 轮询太快挤占 DMA,太慢增加延迟 |
-| D7 | `DOORBELL` 语义 | **锁存 pending 位**,处理到队列空/出错为止 | 覆盖"忙时又敲门"的情形(§9) |
-| D8 | 引擎 payload 深度 | 16 字(64B,覆盖 GEMM 与最大 2D 命令) | `PARAMS` 不进引擎 |
-| D9 | `num_warps` 的翻译 | CP 只发 `num_warps`,**SM 顶层**算槽位/`launch_warp` | CP 不重复 ISA §2.2 的放置逻辑 |
-| D10 | 队列基址/大小的修改时机 | 严格按 §2.1:仅 `IDLE` 且队列空;"空"= **本命令是最后一条**(`cp.cpp:412-416`) | 早一拍拒绝会误伤合法用法 |
-| D11 | 引擎忙碌时 | CP 停在 `X_STREAM` 背压等待(不排队、不丢) | 与 in-order 模型一致;排队是 v2 的事 |
-| D12 | MMIO 访问结构 | **一份状态 + 两个访问口**(寄存器文件在 CP 内,状态机直连;外部走 AXI4-Lite 从口) | §11.1:影子副本会引入并发不一致;而 MMIO 每帧只占 < 1% 的拍数,效率不是理由 |

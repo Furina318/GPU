@@ -226,10 +226,13 @@ make -C sim/run-sim images     # = make -C sim/simulator images
 
 | 内核 | 参考模型 | RTL 全系统(`--warps 4`) |
 |---|---|---|
-| `clear.S` | `make test` → `clear` | 1478 拍,行请求 44,32 个像素逐位一致 |
-| `gouraud.S` | `make test` → `gouraud` | 6434 拍,行请求 148,32 个顶点逐位一致 |
-| `matmul.S` | `make test` → `matmul` | 162926 拍,1024 个元素逐位一致 |
-| `anim.S` | `make anim` | 每帧约 17700 拍(32×32),逐帧逐像素一致 |
+| `clear.S` | `make test` → `clear` | 1254 拍,行请求 38,32 个像素逐位一致 |
+| `gouraud.S` | `make test` → `gouraud` | 6112 拍,行请求 339,32 个顶点逐位一致 |
+| `matmul.S` | `make test` → `matmul` | 156234 拍,行请求 1895,1024 个元素逐位一致 |
+| `anim.S` | `make anim` | 每帧约 14855 拍(32×32),逐帧逐像素一致 |
+
+(上面的周期数是 4 warp、带 CP 命令缓存 `hw/rtl/cache/cmd_cache.sv` 的实测值;
+命令环的 64B 行在缓存里,取指不再每条命令都等一次行读。)
 
 `gouraud`/`matmul` 的期望值在测试台里用 `std::fma` 重算一遍(单次舍入,与内核的
 `fma.f32` 同语义),按位比较;`clear` 直接比较像素颜色;`anim` 按 `anim.S` 的公式

@@ -11,8 +11,9 @@ module cp_adapter_wrap #(
     input  wire [31:0] rd_addr,
     input  wire        rd_line,
     output wire        rd_ack,
-    output wire        rd_rsp,
-    output wire [16*32-1:0] rd_data,
+    output wire        rd_vld,
+    output wire [31:0] rd_word,
+    output wire        rd_last,
     output wire        rd_err,
 
     input  wire        wr_req,
@@ -47,7 +48,8 @@ module cp_adapter_wrap #(
     cp_mem_adapter u_ad (
         .clk(clk), .rst(rst),
         .rd_req(rd_req), .rd_addr(rd_addr), .rd_line(rd_line),
-        .rd_ack(rd_ack), .rd_rsp(rd_rsp), .rd_data(rd_data), .rd_err(rd_err),
+        .rd_ack(rd_ack), .rd_vld(rd_vld), .rd_word(rd_word), .rd_last(rd_last),
+        .rd_err(rd_err),
         .wr_req(wr_req), .wr_addr(wr_addr), .wr_data(wr_data), .wr_strb(wr_strb),
         .wr_ack(wr_ack), .wr_rsp(wr_rsp), .wr_err(wr_err),
         .m_arvalid(m_arvalid), .m_arready(m_arready), .m_araddr(m_araddr),

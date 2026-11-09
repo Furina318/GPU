@@ -253,28 +253,43 @@ module core import core_pkg::*; #(
     wire [4:0] fpu_fflags_keep = fpu_fflags_unused;   // §: FP 异常全非 trapping, 标志位不参与控制
     /* verilator lint_on UNUSEDSIGNAL */
 
-    // ---- 取指口仲裁(4 抢 1) ----
-    logic [WARPS_W-1:0] imem_owner, imem_owner_q;
-    logic       imem_busy_q;
+    // ---- 取指口仲裁(N 抢 1, 同地址合并) ----
+    logic [WARPS_W-1:0] imem_owner;      // 本拍被选中的 warp(轮转结果)
+    logic [WARPS_W-1:0] imem_owner_q;    // 上一拍被选中的 warp(只当轮转指针)
+    logic [WARPS-1:0]   imem_share;      // 本拍: 与 owner 读同一字地址的请求者(含 owner)
+    logic [WARPS-1:0]   imem_share_q;    // 上一拍的 imem_share = 本拍的回读者
     logic [WARPS-1:0] f_imem_req_valid;
     logic [WARPS-1:0][31:0] f_imem_req_pc;
 
     // 轮转: 从上一个被服务者之后开始找 —— 否则 0 号 warp 会一直以
     // "最小号"赢得仲裁, 其余 warp 永久饥饿(多 warp 用例死锁的根因)。
-    assign imem_fetch_en = !imem_busy_q && (|f_imem_req_valid);
-    assign imem_owner    = rr_pick(f_imem_req_valid, imem_owner_q);
+    // 一拍一发: 指令 SRAM 是单读口 + 固定 1 拍回读, 这一拍发出的地址与这一拍
+    // 回来的数据属于不同的请求(见下面的 imem_share_q), 互不干扰 —— 所以不需要
+    // "上一次还没回读就停发"的闸门, 原来那个闸门把发射率砍成了 1/2。
+    assign imem_fetch_en   = |f_imem_req_valid;
+    assign imem_owner      = rr_pick(f_imem_req_valid, imem_owner_q);
     assign imem_fetch_addr = f_imem_req_pc[imem_owner][`CLOG_INSTR+1:2];
 
-    // 取指数据下一拍有效: 记住这一拍是谁发的
+    // 同地址合并: 与 owner 读同一个 SRAM 字的 warp 一起被授予, 共用这一拍的回读。
+    // 内核入口、bar.sync 放行之后、以及锁步循环里, 多个 warp 的 PC 本来就相同,
+    // 一次读就能喂饱全部 —— 不必让它们排队各读一次。
+    always_comb begin
+        imem_share = '0;
+        for (int s = 0; s < WARPS; s = s + 1)
+            imem_share[s] = f_imem_req_valid[s] &&
+                (f_imem_req_pc[s][`CLOG_INSTR+1:2] ==
+                 f_imem_req_pc[imem_owner][`CLOG_INSTR+1:2]);
+    end
+
+    // 回读者的记账: SRAM 固定 1 拍回读 ⇒ 本拍的回读属于上一拍的授予集合。
+    // 只需要一个寄存器(上一拍的授予集合), 不需要额外的 busy 状态位。
     always_ff @(posedge clk) begin
         if (rst) begin
-            imem_busy_q  <= 1'b0;
-            imem_owner_q <= 2'd0;
-        end else if (imem_fetch_en) begin
-            imem_busy_q  <= 1'b1;
-            imem_owner_q <= imem_owner;
+            imem_owner_q <= '0;
+            imem_share_q <= '0;
         end else begin
-            imem_busy_q  <= 1'b0;
+            imem_share_q <= imem_fetch_en ? imem_share : '0;
+            if (imem_fetch_en) imem_owner_q <= imem_owner;
         end
     end
 
@@ -289,7 +304,12 @@ module core import core_pkg::*; #(
             /* verilator lint_off UNUSEDSIGNAL */
             logic                   fet_in_valid, fet_in_ready;   // ready 只作观察
             /* verilator lint_on UNUSEDSIGNAL */
-            logic                   fet_out_valid, fet_out_ready;
+            logic                   fet_out_valid;
+            // 握手用组合的 ready: warp 停在 W_IDLE 就代表前端随时能接一条指令。
+            // 原来它是寄存器(离开 W_IDLE 时清 0、回到 W_IDLE 后下一拍才置 1),
+            // 于是每取一条指令都白等一拍 —— 组合化之后取指到译码少一拍。
+            logic                   fet_out_ready;
+            assign fet_out_ready = (wst == W_IDLE);
             logic [31:0]            f_pc, f_inst;
             logic [LANES-1:0]       f_inst_mask;
             logic [31:0]            f_target_pc;
@@ -378,8 +398,8 @@ module core import core_pkg::*; #(
                 .target_taken   (f_target_taken),
                 .imem_req_valid (f_imem_req_valid[W]),
                 .imem_req_pc    (f_imem_req_pc[W]),
-                .imem_req_ready (imem_fetch_en && (imem_owner == W[1:0])),
-                .imem_rsp_valid (imem_busy_q && (imem_owner_q == W[1:0])),
+                .imem_req_ready (imem_fetch_en && imem_share[W]),
+                .imem_rsp_valid (imem_share_q[W]),
                 .imem_rsp_inst  (imem_fetch_data),
                 .br_pending     (f_br_pending),
                 .br_local       (f_br_local),
@@ -598,7 +618,6 @@ module core import core_pkg::*; #(
                     dec_lat_vld   <= 1'b0;
                     dec_lat       <= '0;
                     mask_lat      <= '0;
-                    fet_out_ready <= 1'b0;
                     dec_in_v      <= 1'b0;
                     latch_pc      <= 32'h0;
                     latch_inst    <= 32'h0;
@@ -621,7 +640,6 @@ module core import core_pkg::*; #(
                         dec_lat_vld   <= 1'b0;
                         dec_in_v      <= 1'b0;
                         dec_lat       <= '0;
-                        fet_out_ready <= 1'b0;
                         ex_en         <= 1'b0;
                     end else if (sm_halt) begin
                         if (!warp_done[W]) wst <= W_EXIT;
@@ -634,17 +652,14 @@ module core import core_pkg::*; #(
                     end else begin
                         unique case (wst)
                             W_IDLE: begin
-                                // fet_out_ready 是寄存器: 前一拍先举手, 下一拍才谈握手。
-                                // 握手那一拍必须让 fetch 看到 ready=1, 否则它永远停在 S_SENT。
+                                // ready 是组合的(wst == W_IDLE), 所以 fetch 停在 S_SENT
+                                // 的那一拍就能直接握手, 收下指令进译码。
                                 if (fet_out_valid && fet_out_ready) begin
                                     latch_pc      <= f_pc;
                                     latch_inst    <= f_inst;
                                     mask_lat      <= f_inst_mask;
                                     dec_in_v      <= 1'b1;
-                                    fet_out_ready <= 1'b0;
                                     wst           <= W_DEC;
-                                end else begin
-                                    fet_out_ready <= 1'b1;
                                 end
                             end
                             W_DEC: begin

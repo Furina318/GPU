@@ -1,27 +1,12 @@
 `include "defines.vh"
 
-// ============================================================================
-//  lsu —— 每 warp 一个的访存单元(ISA §3.2, MEM_LSU.md §4.3)
-//
-//  一条访存指令的生命周期:
-//    ① 地址/对齐检查(lane 级): `addr[1:0] != 0` ⇒ BAD_ALIGN;
-//    ② 按 `.s` / `.g` 分派:
-//       `.s` 走共享内存端口(共享地址是独立的 16KB 空间,越界由 shared_mem 报);
-//       `.g` 先经 mem_map 判区域(MMIO/未映射 ⇒ 各自错误码),再按 32B 行合并后
-//           逐个行请求发往 global_mem(WCB 写合并 + AXI);
-//    ③ 读数据按 lane 回填,连同 `rd`/`pc`/`inst` 一起交给 wbu 写寄存器。
-//
-//  握手风格对齐 mdu.sv: `mem_en` 发起, `mem_ready` 表示当拍可收,
-//  完成时 `mem_done` 单拍脉冲,并携带 `done_*` 元数据。
-// ============================================================================
-
 module lsu #(
     parameter int LANES = `WARP_SIZE
 ) (
     input  wire                        clk         ,
     input  wire                        rst         ,
 
-    // ---- 来自 EXU / 寄存器堆 ----
+    // 来自 EXU / 寄存器堆
     input  wire                        mem_en      ,   // 本拍有一条访存指令
     input  wire                        mem_we      ,   // 1 = store
     input  wire                        mem_shared  ,   // 1 = `.s`(共享内存)
@@ -33,7 +18,7 @@ module lsu #(
     input  wire [LANES-1:0][31:0]      lane_wdata  ,
     output logic                       mem_ready   ,
 
-    // ---- 共享内存端口(到 lsu_scheduler) ----
+    // 共享内存端口(到 lsu_scheduler)
     output logic                       smem_req_valid,
     output logic                       smem_req_we   ,
     output logic [LANES-1:0]           smem_lane_en  ,
@@ -46,7 +31,7 @@ module lsu #(
     input  wire                        smem_err_align,
     input  wire                        smem_err_oob  ,
 
-    // ---- 全局内存端口(每拍一个 32B 行请求, 到 lsu_scheduler) ----
+    // 全局内存端口(每拍一个 32B 行请求, 到 lsu_scheduler)
     output logic                       gmem_req_valid,
     output logic                       gmem_req_we   ,
     output logic [26:0]                gmem_req_line ,
@@ -57,7 +42,7 @@ module lsu #(
     input  wire [LANES-1:0][31:0]      gmem_rsp_data ,
     input  wire                        gmem_rsp_err  ,
 
-    // ---- 完成(交给 wbu) ----
+    // 完成
     output logic                       mem_done    ,
     output logic                       mem_done_rd ,
     output logic [4:0]                 mem_done_addr,
@@ -66,19 +51,14 @@ module lsu #(
     output logic [LANES-1:0]           mem_done_we ,   // 该 lane 有有效结果
     output logic [LANES-1:0][31:0]     mem_done_rdata,
 
-    // ---- 错误上报(SM 错误码见 CMDS §8.2)----
+    // 错误
     output logic                       mem_err     ,
     output logic [3:0]                 mem_err_code,
     output logic                       mem_busy    ,
     output logic [3:0]                 mem_conflict   // 共享内存冲突额外拍(计费用)
 );
 
-    // ======================================================================
     //  地址检查(组合)
-    //
-    //  L_IDLE 拍用的是**当拍输入**(mem_en 发起的那一刻), 后几拍用的是锁存值;
-    //  否则会拿上一条指令的 shared/we 去判这一条的地址。
-    // ======================================================================
     logic [LANES-1:0]        cur_mask;
     logic [LANES-1:0][31:0]  cur_addr;
     logic                    cur_we, cur_shared;
@@ -105,19 +85,17 @@ module lsu #(
             assign bad_shared[gi] = cur_mask[gi] && (|cur_addr[gi][31:14]);
 
             mem_map u_map (
-                .addr        (cur_addr[gi]   ),
-                .is_store    (cur_we         ),
-                .region      (region_unused[gi]),
-                .writable    (m_region_wr[gi]),
-                .err_mmio    (m_region_mmio[gi]),
-                .err_no_region(m_region_none[gi])
+                .addr         (cur_addr[gi]      ),
+                .is_store     (cur_we            ),
+                .region       (region_unused[gi] ),
+                .writable     (m_region_wr[gi]   ),
+                .err_mmio     (m_region_mmio[gi] ),
+                .err_no_region(m_region_none[gi] )
             );
         end
     endgenerate
 
-    // ======================================================================
     //  合并(.g 路径):8 lane → N 个 32B 行请求
-    // ======================================================================
     logic [3:0]                  coal_num;
     logic [LANES-1:0][31:0]      coal_line;
     logic [LANES-1:0][LANES-1:0] coal_lanes;
@@ -150,9 +128,6 @@ module lsu #(
                     coal_wdata[pi] = lane_wdata[li];
     end
 
-    // ======================================================================
-    //  FSM
-    // ======================================================================
     typedef enum logic [2:0] {
         L_IDLE, L_SMEM, L_GM_REQ, L_GM_WAIT, L_DONE
     } lsu_state_t;

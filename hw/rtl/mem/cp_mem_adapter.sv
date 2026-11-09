@@ -1,21 +1,11 @@
 `include "defines.vh"
 
-// ============================================================================
 //  cp_mem_adapter —— CP 的行/字访存协议 → AXI4 主口
-//
-//  CP 的内存口是"请求 → ack → rsp"的两段式:
-//    读: mem_rd_req + mem_rd_addr + mem_rd_line(1 = 64B 行, 0 = 4B 字)
-//        接受后回 mem_rd_ack(单拍), 数据回来时回 mem_rd_rsp + mem_rd_data
-//    写: mem_wr_req + mem_wr_addr + mem_wr_data + mem_wr_strb
-//        接受后回 mem_wr_ack, 落盘完成回 mem_wr_rsp
-//  本模块把它翻成 AXI4: 64B 行 = 两段 8 拍 burst(32B), 4B 字 = 1 拍 burst。
-//  CP 一次只有一个内存操作在飞, 所以这里不做 pipelining(outstanding = 1)。
-// ============================================================================
+//  CP 一次只有一个内存操作在飞, 所以这里不做 pipelining
 
 module cp_mem_adapter #(
-    parameter int LINE_WORDS = 16,
-    parameter int ADDR_W     = 32,
-    parameter int DATA_W     = 32
+    parameter int ADDR_W = 32,
+    parameter int DATA_W = 32
 ) (
     input  wire clk,
     input  wire rst,
@@ -24,10 +14,13 @@ module cp_mem_adapter #(
     input  wire                     rd_req,
     input  wire [ADDR_W-1:0]        rd_addr,
     input  wire                     rd_line,
-    output logic                    rd_ack,
-    output logic                    rd_rsp,
-    output logic [LINE_WORDS*32-1:0] rd_data,
-    output logic                    rd_err,
+    output logic                    rd_ack,      // 请求收下了(地址已采样, 还没有数据)
+    // 读回来的数据按 AXI R 的节奏一拍一个字吐出(与 m_rvalid 同拍), 不再攒整行:
+    // 512 位的行缓冲和"攒满再回"的两个状态都不需要了
+    output logic                    rd_vld,      // 本拍有一个字
+    output logic [DATA_W-1:0]       rd_word,
+    output logic                    rd_last,     // 本次读的最后一个字
+    output logic                    rd_err,      // 与 rd_word 同拍的响应错误
 
     input  wire                     wr_req,
     input  wire [ADDR_W-1:0]        wr_addr,
@@ -66,8 +59,10 @@ module cp_mem_adapter #(
     input  wire [1:0]           m_bresp
 );
 
+    // 读: A_RD_AR 发 AR, A_RD_BEAT 逐拍把 R 通道的数据转给上层。
+    // 行读 = 两段 8 拍 burst, 中间回 A_RD_AR 重发一次;字读 = 1 拍。
     typedef enum logic [2:0] {
-        A_IDLE, A_RD_AR, A_RD_BEAT, A_RD_LAT, A_RD_RSP, A_WR_AW, A_WR_B
+        A_IDLE, A_RD_AR, A_RD_BEAT, A_WR_AW, A_WR_B
     } astate_t;
 
     astate_t state;
@@ -75,10 +70,7 @@ module cp_mem_adapter #(
     logic                is_line_q;
     logic [DATA_W/8-1:0] strb_q;
     logic [  DATA_W-1:0] wdata_q;
-    logic [4:0]        beat_q;        // 0..15 行内拍号(全局计数)
     logic              seg2_q;        // 1 = 正在取 64B 行的后 32B
-    logic [ 3:0]       err_q;
-    logic [31:0]       rbuf_q [0:LINE_WORDS-1];
 
     // handshake
     wire rd_hs = m_arvalid && m_arready;
@@ -99,6 +91,12 @@ module cp_mem_adapter #(
     assign m_arburst = 2'b01;           // INCR
     assign m_rready  = (state == A_RD_BEAT);
 
+    // 数据直通: 不再攒整行, 每拍一个 32 位字直接交给上层
+    assign rd_vld  = (state == A_RD_BEAT) && m_rvalid;
+    assign rd_word = m_rdata;
+    assign rd_last = rd_vld && m_rlast && (!is_line_q || seg2_q);
+    assign rd_err  = rd_vld && (m_rresp != 2'b00);
+
     assign m_awvalid = (state == A_WR_AW);
     assign m_awaddr  = addr_q & ~ADDR_W'(3);   // 字对齐
     assign m_awlen   = 8'd0;
@@ -110,19 +108,13 @@ module cp_mem_adapter #(
     assign m_wlast   = 1'b1;
     assign m_bready  = (state == A_WR_B);
 
-    // 读数据锁存: 行访问按拍号落到 rbuf
     always_ff @(posedge clk) begin
         if (rst) begin
             state      <= A_IDLE;
             addr_q     <= '0;
             is_line_q  <= 1'b0;
-            beat_q     <= '0;
             seg2_q     <= 1'b0;
-            err_q      <= '0;
             rd_ack     <= 1'b0;
-            rd_rsp     <= 1'b0;
-            rd_data    <= '0;
-            rd_err     <= 1'b0;
             wr_ack     <= 1'b0;
             wr_rsp     <= 1'b0;
             wr_err     <= 1'b0;
@@ -130,17 +122,13 @@ module cp_mem_adapter #(
             strb_q     <= '0;
         end else begin
             rd_ack <= 1'b0;
-            rd_rsp <= 1'b0;
-            rd_err <= 1'b0;
             wr_ack <= 1'b0;
             wr_rsp <= 1'b0;
             wr_err <= 1'b0;
 
             case (state)
                 A_IDLE: begin
-                    beat_q <= '0;
                     seg2_q <= 1'b0;
-                    err_q  <= '0;
                     if (rd_req) begin
                         addr_q    <= rd_addr;
                         is_line_q <= rd_line;
@@ -160,34 +148,15 @@ module cp_mem_adapter #(
                 end
 
                 A_RD_BEAT: begin
-                    if (r_hs) begin
-                        rbuf_q[beat_q[3:0]] <= m_rdata;
-                        if (m_rresp != 2'b00) err_q <= 4'd1;
-                        if (m_rlast) begin
-                            if (is_line_q && !seg2_q) begin
-                                // 第一段 8 拍结束, 接着取后 32B
-                                beat_q <= 5'd8;
-                                seg2_q <= 1'b1;
-                                state  <= A_RD_AR;
-                            end else begin
-                                beat_q <= beat_q + 5'd1;
-                                state  <= A_RD_LAT;
-                            end
+                    if (r_hs && m_rlast) begin
+                        if (is_line_q && !seg2_q) begin
+                            // 第一段 8 拍结束, 接着取后 32B
+                            seg2_q <= 1'b1;
+                            state  <= A_RD_AR;
                         end else begin
-                            beat_q <= beat_q + 5'd1;
+                            state <= A_IDLE;      // 最后一拍已经直接交给上层了
                         end
                     end
-                end
-
-                A_RD_LAT: begin
-                    for (int i = 0; i < LINE_WORDS; i = i + 1) rd_data[i*32 +: 32] <= rbuf_q[i];
-                    state <= A_RD_RSP;
-                end
-
-                A_RD_RSP: begin
-                    rd_err <= |err_q;
-                    rd_rsp <= 1'b1;          // 数据已在上一拍锁进 rd_data
-                    state  <= A_IDLE;
                 end
 
                 A_WR_AW: begin

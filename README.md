@@ -53,7 +53,7 @@ make sg                   # sw/sg/*.sg → build/sg/*.bin
 
 # 4) RTL 单元/子系统测试(cocotb + Verilator)
 cd tb && make setup       # 一次性:安装固定版本 Verilator 到 tb/.tools
-make test                 # 跑全部 22 个 DUT 配置 / 120 个用例
+make test                 # 跑全部 22 个 DUT 配置 / 121 个用例
 make dut DUT=cp           # 单个 DUT;可加 TEST=<正则> 过滤用例
 
 # 5) RTL 全系统仿真:整颗 GPU(CP + 2×SM + 内存子系统 + DDR)跑真实内核
@@ -84,7 +84,7 @@ make -C sim/run-sim check     # 依次跑 clear / gouraud / matmul / anim 并与
 | `sim/simulator/` | C++ 全系统模拟器:参考模型(`src/`、`shader/`、`2D-engine/`)、内核校验、demo、调试器 |
 | `sim/run-sim/` | RTL 全系统仿真:Verilator 测试台把 CP + 2×SM + 内存子系统连起来跑 `sw/kernels/*.S` |
 | `sw/` | 汇编器 `assembly.py`、sg 语言编译器 `compiler.py`、内核 `kernels/*.S`、demo `demo/`、语言手册 `grammer.md` |
-| `tb/` | cocotb 测试平台:22 个 DUT 配置、120 个用例;`README.md` 是测试指南 |
+| `tb/` | cocotb 测试平台:22 个 DUT 配置、121 个用例;`README.md` 是测试指南 |
 
 ## 4. 文档地图
 

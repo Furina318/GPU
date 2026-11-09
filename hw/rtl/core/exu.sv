@@ -1,17 +1,5 @@
 `include "defines.vh"
 
-// ============================================================================
-//  exu —— 每 warp 一个的执行单元
-//
-//  一条指令在这里走完:
-//    · ALU / setp / tmov / wmov: 8 lane 并行, 1 拍出结果;
-//    · MDU(乘除): 逐 lane 串行复用同一个 `mdu`(8 lane ⇒ 8 次);
-//    · 访存: 交给同 warp 的 `lsu`, 等它回 `mem_done`;
-//    · 分支: 只给出"哪些 lane 谓词为真", 压栈/收敛由 `fetch` 的 SIMT 栈处理。
-//
-//  完成时给 `wbu` 送一次写回(单拍脉冲 `wb_valid`)。
-// ============================================================================
-
 module exu import core_pkg::*; #(
     parameter int LANES = `WARP_SIZE
 ) (
@@ -20,17 +8,16 @@ module exu import core_pkg::*; #(
     /* verilator lint_off UNUSEDSIGNAL */
     input  wire                     warp_active ,   // 本 warp 还没 exit(core 侧用停机控制)
     /* verilator lint_on UNUSEDSIGNAL */
-    input  wire [2:0]               warp_id     ,   // wmov 用(= wid), 支持到每 SM 8 个 warp
+    input  wire [2:0]               warp_id     ,  
 
-    // ---- 译码结果与操作数(来自 regfile) ----
     input  wire core_pkg::dec_info_t dec        ,
     input  wire [`WARP_SIZE-1:0]    eff_mask    ,
     input  wire [LANES-1:0][31:0]   rs1_data    ,
     input  wire [LANES-1:0][31:0]   rs2_data    ,
-    input  wire [LANES-1:0][31:0]   rs3_data    ,   // fma 的第三个源(inst[31:27])
+    input  wire [LANES-1:0][31:0]   rs3_data    ,  
     input  wire [LANES-1:0]         pred_data   ,   // 该指令所选谓词, 每 lane 1 bit
     input  wire                     ex_en       ,   // 本拍这条指令可以执行
-    output logic                    ex_ready    ,   // 可以收(`ex_en` 只在 ready 时有效)
+    output logic                    ex_ready    ,   
 
     // ---- 写回(wbu) ----
     output logic                    wb_valid    ,
@@ -85,9 +72,6 @@ module exu import core_pkg::*; #(
 
     localparam int LW = $clog2(LANES);
 
-    // ======================================================================
-    //  ALU(8 lane 并行)
-    // ======================================================================
     logic [LANES-1:0][31:0] alu_src2;
     logic [LANES-1:0][31:0] alu_res;
 
@@ -104,29 +88,25 @@ module exu import core_pkg::*; #(
         end
     endgenerate
 
-    // ======================================================================
     //  setp: 每 lane 一个比较位
-    // ======================================================================
     logic [LANES-1:0] setp_bit;
 
     function automatic logic cmp_setp(input logic [2:0] cond, input logic [1:0] fam,
                                       input logic [31:0] a, input logic [31:0] b);
-        logic eq, lt, gt;
-        logic [31:0] fa, fb;
+        logic eq, lt, lt_u;   // lt_u: 无符号小于是有符号小的基础(符号不同时才不同)
         begin
-            fa = a;
-            fb = b;
             // 比较只在整数域上做(setp 的 FP 家族暂未接 FPU, 按位比较)
-            eq = (fa == fb);
-            lt = (fam == 2'd1) ? (fa < fb) : ($signed(fa) < $signed(fb));
-            gt = (fam == 2'd1) ? (fa > fb) : ($signed(fa) > $signed(fb));
+            eq   = (a == b);
+            lt_u = (a < b);   // 仅计算一次无符号小于比较
+            if (fam == 2'b1) lt = lt_u;
+            else             lt = (a[31] ^ b[31]) ? a[31] : lt_u;
             unique case (cond)
                 3'd0: cmp_setp = eq;
                 3'd1: cmp_setp = ~eq;
                 3'd2: cmp_setp = lt;
                 3'd3: cmp_setp = ~lt;
-                3'd4: cmp_setp = ~gt;
-                default: cmp_setp = gt;
+                3'd4: cmp_setp = eq | lt;
+                default: cmp_setp = ~(eq | lt);
             endcase
         end
     endfunction
@@ -139,15 +119,10 @@ module exu import core_pkg::*; #(
         end
     endgenerate
 
-    // ======================================================================
-    //  分支: 谓词为真的 lane(谓词取反由 dec.pred_inv 给出, 已在 regfile 前处理)
-    // ======================================================================
+    //  分支: 谓词为真的 lane
     assign br_taken = pred_data;
     assign br_target = dec.br_target;
 
-    // ======================================================================
-    //  FSM
-    // ======================================================================
     typedef enum logic [2:0] {
         E_IDLE, E_LSU, E_MDU, E_FPU, E_WB, E_DONE
     } exu_state_t;
@@ -157,10 +132,9 @@ module exu import core_pkg::*; #(
     logic [LW-1:0]  lane_q;          // MDU 串行: 当前 lane
     logic [31:0]    pc_q, inst_q;
     /* verilator lint_off UNUSEDSIGNAL */
-    // 只锁存用得到的字段(wr_gpr/rd/fpu_op/frm/imad_en/...), 其余位宽留着不影响
     dec_info_t      dec_q;
     /* verilator lint_on UNUSEDSIGNAL */
-    logic [LANES-1:0] mask_q;
+    logic [LANES-1:0]       mask_q;
     logic [LANES-1:0][31:0] rs1_q, rs2_q;
     logic [LANES-1:0]       wb_acc_done;
     logic [LANES-1:0][31:0] wb_acc;  // 多拍指令累积写回数据
@@ -187,32 +161,31 @@ module exu import core_pkg::*; #(
     logic        mdu_ready, mdu_done;
     logic [31:0] mdu_src1, mdu_src2, mdu_result;
     /* verilator lint_off UNUSEDSIGNAL */
-    // mdu 的完成现场(rd / gpr_we / pc / inst)本层不用: 写回用的是指令自身的
-    // dec_q.rd / dec_q.wr_gpr, 这样即使 MDU 的完成队列有偏也不会串到别的 lane。
+    // mdu 的完成现场
     logic [4:0]  mdu_rd_done;
     logic        mdu_gpr_we_done;
     logic [31:0] mdu_pc_done, mdu_inst_done;
     /* verilator lint_on UNUSEDSIGNAL */
 
     mdu u_mdu (
-        .clk          (clk),
-        .rst          (rst),
-        .mdu_en       (mdu_en),
-        .mdu_op       (dec_q.mdu_op),
-        .mdu_src1     (mdu_src1),
-        .mdu_src2     (mdu_src2),
-        .mdu_rd       (dec_q.rd),
-        .mdu_gpr_we   (dec_q.wr_gpr),
-        .mdu_pc       (pc_q),
-        .mdu_inst     (inst_q),
-        .mdu_ready    (mdu_ready),
-        .mdu_done     (mdu_done),
-        .mdu_result   (mdu_result),
-        .mdu_done_rd  (mdu_rd_done),
+        .clk            (clk            ),
+        .rst            (rst            ),
+        .mdu_en         (mdu_en         ),
+        .mdu_op         (dec_q.mdu_op   ),
+        .mdu_src1       (mdu_src1       ),
+        .mdu_src2       (mdu_src2       ),
+        .mdu_rd         (dec_q.rd       ),
+        .mdu_gpr_we     (dec_q.wr_gpr   ),
+        .mdu_pc         (pc_q           ),
+        .mdu_inst       (inst_q         ),
+        .mdu_ready      (mdu_ready      ),
+        .mdu_done       (mdu_done       ),
+        .mdu_result     (mdu_result     ),
+        .mdu_done_rd    (mdu_rd_done    ),
         .mdu_done_gpr_we(mdu_gpr_we_done),
-        .mdu_done_pc  (mdu_pc_done),
-        .mdu_done_inst(mdu_inst_done),
-        .mdu_done_ack (mdu_ack)
+        .mdu_done_pc    (mdu_pc_done    ),
+        .mdu_done_inst  (mdu_inst_done  ),
+        .mdu_done_ack   (mdu_ack        )
     );
 
     assign mdu_src1 = rs1_q[lane_q];
@@ -221,8 +194,6 @@ module exu import core_pkg::*; #(
     // 否则每个周期都会重复发同一条 op, 拍完的结果按"当前 lane_q"错位回填。
     assign mdu_en   = (st == E_MDU) && mask_q[lane_q] && !wb_acc_done[lane_q] &&
                       !mdu_started;
-    // 完成队列必须由消费方确认:常 1 的 ack 会让队头在 EXU 取数之前就被弹掉,
-    // rd/写使能这些"随结果一起回来"的字段就会错位(mul 的结果被写到 r0 去)。
     assign mdu_ack  = (st == E_MDU) && mdu_started && mdu_done;
 
     // 下一个要处理的 lane(只在需要写的 lane 上走)
@@ -242,9 +213,7 @@ module exu import core_pkg::*; #(
         end
     endfunction
 
-    // ======================================================================
     //  写回数据选择
-    // ======================================================================
     logic [LANES-1:0][31:0] wb_now;
 
     always_comb begin : wb_pick
@@ -340,9 +309,7 @@ module exu import core_pkg::*; #(
                             wb_gpr_addr  <= dec.rd;
                             wb_gpr_data  <= wb_now;
                             wb_pred_we   <= dec.setp_en;
-                            // setp_pdst 是 p1/p2/p3 的 one-hot, 这里翻译成谓词号。
-                            // (直接截取低 2 位会把 p3 的 3'b100 变成 p0, 于是 setp 写 p3
-                            //  实际写进了只读的 p0, 循环条件永远读到旧值)
+                            // setp_pdst 是 p1/p2/p3 的 one-hot, 这里翻译成谓词号
                             wb_pred_addr <= dec.setp_pdst[2] ? `CLOG_PRED'(2'd3)
                                           : dec.setp_pdst[1] ? `CLOG_PRED'(2'd2)
                                                              : `CLOG_PRED'(2'd1);

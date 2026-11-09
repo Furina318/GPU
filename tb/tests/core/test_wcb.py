@@ -250,3 +250,44 @@ async def test_random_sequence(dut):
             sb.check_equal(got == want, True, f"step{step} 冲刷内容")
             m.items.clear()
     sb.report()
+
+
+@cocotb.test()
+async def test_drain_vs_merge_race(dut):
+    """回归: 某一项正被下游取走的那一拍, 同行的 store 不能被合并进这一项。
+
+    写引擎在"取走"那一拍就把该项数据拍进了自己的寄存器, 之后再合并进来的字
+    永远写不出去 —— 实测在 RTL 全系统仿真里表现为 gouraud 丢掉 2/32 个顶点
+    (取指提速后暴露, 之前只是恰好没撞上)。
+    """
+    sb = Scoreboard("wcb-race")
+    await fresh(dut)
+    line = 0x1234 // LINE_BYTES
+    await store(dut, line, 0b0000_0001, [0x11] + [0] * 7)
+
+    # 同一拍: 下游把这一项取走(out_ready=1) + 又来一条同行的 store(写另一个字)
+    await FallingEdge(dut.clk)
+    dut.out_ready.value = 1
+    dut.wr_valid.value = 1
+    dut.wr_line.value = line
+    dut.wr_wen.value = 0b0000_0010
+    for w in range(WORDS):
+        dut.wr_wdata[w].value = 0x22 if w == 1 else 0
+    await Timer(1, "ns")
+    sb.check_equal(int(dut.out_valid.value), 1, "取走那一拍 out_valid")
+    sb.check_equal(int(dut.out_wen.value), 0b0000_0001, "取走的是旧内容(只有 word0)")
+    # 这一项正要离开 ⇒ 同行的 store 必须另占一个空项, 而不是合并进它
+    sb.check_equal(int(dut.wr_ready.value), 1, "同拍 store 必须被接受(另占一项)")
+    await RisingEdge(dut.clk)
+    await FallingEdge(dut.clk)
+    dut.wr_valid.value = 0
+    dut.out_ready.value = 0
+    await Timer(1, "ns")
+
+    # 剩下的那一项应该是刚才那条 store: 只有 word1
+    written = await drain(dut)
+    sb.check_int(len(written), 1, "缓冲里剩下的项数")
+    sb.check_equal(written[0][0], line, "剩余项的 line")
+    sb.check_equal(written[0][1], 0b0000_0010, "剩余项的写掩码")
+    sb.check_int(written[0][2][1], 0x22, "word1 的新值不能丢")
+    sb.report()

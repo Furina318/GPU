@@ -1,6 +1,6 @@
 # SPEC.md —— SimpleGPU 系统规格与模块接口
 
-版本 0.7 · 关联文档:`ISA.md`(Shader 核)/ `CMDS.md`(命令集)/ `GFX.md`(2D 引擎)· 变更记录见 [附录 A](#附录-a变更记录)
+版本 0.8 · 关联文档:`ISA.md`(Shader 核)/ `CMDS.md`(命令集)/ `GFX.md`(2D 引擎)· 变更记录见 [附录 A](#附录-a变更记录)
 
 > **读者指引**
 >
@@ -132,7 +132,7 @@ SIMT 栈 8 深/warp(12B/帧,96B/warp)。
 |---|---|---|---|
 | in | `launch` | `{pc[32], num_warps[4], flags[4]}` | 来自 CP;`flags` 已与镜像头交叉核对 |
 | out | `imem_req` | `{pc[32], valid}` | 每周期最多 1 次取指;`valid` 限定"这一拍要读";SM 内部接 `mem/instr_mem.sv` 的取指口(取 `pc[13:2]` 当字地址) |
-| in | `imem_rsp` | `{inst[32], valid}` | 指令 SRAM(预加载,无 icache);`valid` 比 `req` 晚 1 拍 |
+| in | `imem_rsp` | `{inst[32], valid}` | 指令 SRAM(预加载,无 icache);`valid` 比 `req` 晚 1 拍。SM 内部 4 个 warp 共用这一个口:轮转仲裁、同拍同 PC 共读一次(ISA §8) |
 | in | `imem_load` | 见 §3.1 的 `sram_load` | `LOAD_KERNEL` 的预加载口(来自 CP),端口定义以 `mem/instr_mem.sv` 为准 |
 | out | `dmem_req` | `{op[1], addr[32], wdata[32][8], mask[8]}` | 全局访存(8 lane 合并后的请求) |
 | in | `dmem_rsp` | `{rdata[32][8], err}` | 合并读回;`err` 含对齐/越界 |
@@ -165,7 +165,7 @@ SIMT 栈 8 深/warp(12B/帧,96B/warp)。
 | 方向 | 端口 | 说明 |
 |---|---|---|
 | in | `master_req/rsp`(多主) | CP 的 DMA + 2 个 SM 的访存 + 各引擎,仲裁后走 AXI4 主口 |
-| — | 写合并缓冲 | 每 SM 一个(8 项 × 32B 行):`st.g` 先入缓冲、按行按字合并;写引擎空闲时按行写出,`exit`/`bar.sync` 等它排空且写通路回空闲才算可见 |
+| — | 写合并缓冲 | 每 SM 一个(8 项 × 32B 行):`st.g` 先入缓冲、按行按字合并;写引擎空闲时按行写出,`exit`/`bar.sync` 等它排空且写通路回空闲才算可见。正在交给写引擎的那一项不再接受合并 |
 | — | 共享内存 / 指令 SRAM | 每 SM 各 16KB,物理上 SM 私有(文件在 `hw/rtl/mem/`,由 SM 顶层实例化) |
 
 **契约**:
@@ -229,7 +229,7 @@ RTL 综合后要回来标定 `ISA.md` §8.1 的目标值。
 | 入口 | 覆盖内容 |
 |---|---|
 | `cd sim/simulator && make test` | 文档审计(`tests/doc_consistency_check.py`:章节引用、目录锚点、变更记录编号、跨文档编码一致)+ ISA 表↔汇编器↔译码器往返(`isa_ref_check.py`)+ SIMT 栈状态机的独立实现(`stack_model_check.py`)+ 功能回归(`tests/run_tests.py`:错误路径、运行模式、2D 引擎逐像素对拍、car demo、`sg` 编译器) |
-| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(22 个 DUT 配置、120 个用例);`--werror` 打开严格 lint |
+| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(22 个 DUT 配置、121 个用例);`--werror` 打开严格 lint |
 | `cd sim/run-sim && make check` | RTL 全系统仿真:CP + 2×SM + 内存子系统 + DDR 连起来跑 `clear`/`gouraud`/`matmul`,结果与参考模型逐位对拍 |
 
 - **参考模型是独立的第二实现**:shader 核(`sim/simulator/shader/`)、2D 引擎(`2D-engine/gfx2d.cpp` + `tests/gfx2d_ref.py`)、CP(`src/cp.cpp`)、内存子系统(`sim/simulator/src/memory.cpp`)。RTL 与模型逐位对齐,不允许"自证":同一个 `.S` 内核在两套实现上跑,结果按位比较(`sim/run-sim/`)。
@@ -262,5 +262,6 @@ RTL 综合后要回来标定 `ISA.md` §8.1 的目标值。
 | 4 | v0.5 | 手册化:§6 改为"验证与工具链"(原开发流程叙述移至 `docs/HISTORY.md` §5),§7 待定项改为现状表,附录压缩为版本摘要,头部加读者指引 |
 | 5 | v0.6 | §6 增加 RTL 全系统仿真入口(`sim/run-sim/`,22 个 RTL DUT 配置);内存子系统落到 RTL 后 `memory.cpp` 正式列为第二实现 |
 | 6 | v0.7(本次) | §3.4 写合并缓冲的写出时机按 RTL 写清(不再有独立的冲刷请求端口);§6 用例数更新为 120 |
+| 7 | v0.8(本次) | §3.2/§3.4 补实现约束:SM 内部 4 warp 共用一个取指口(轮转 + 同地址合并);写合并缓冲正在交出的那一项拒绝新合并 |
 
 > 每条改动的理由与跨文档冲突的处置过程见 `docs/HISTORY.md`;逐条提交记录见 `git log`。

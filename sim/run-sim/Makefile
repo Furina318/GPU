@@ -34,7 +34,8 @@ else
 endif
 
 RTL_INC := -I$(ROOT)/hw/rtl -I$(ROOT)/hw/rtl/core -I$(ROOT)/hw/rtl/mem \
-           -I$(ROOT)/hw/rtl/cp -I$(ROOT)/hw/rtl/fpu -I$(ROOT)/tb/harness/rtl
+           -I$(ROOT)/hw/rtl/cp -I$(ROOT)/hw/rtl/fpu -I$(ROOT)/hw/rtl/cache \
+           -I$(ROOT)/tb/harness/rtl
 
 SRCS := \
   $(ROOT)/hw/rtl/core/core_pkg.sv \
@@ -52,6 +53,7 @@ SRCS := \
   $(ROOT)/hw/rtl/fpu/fdiv.v $(ROOT)/hw/rtl/fpu/fsqrt.v \
   $(ROOT)/hw/rtl/fpu/fcvt.v $(ROOT)/hw/rtl/fpu/fquick.v \
   $(ROOT)/hw/rtl/fpu/fpu_arbiter.v $(ROOT)/hw/rtl/fpu/frm.v \
+  $(ROOT)/hw/rtl/cache/cache_sram.sv $(ROOT)/hw/rtl/cache/cmd_cache.sv \
   $(ROOT)/hw/rtl/cp/cp_pkg.sv $(ROOT)/hw/rtl/cp/axil_slave.sv \
   $(ROOT)/hw/rtl/cp/cp_regs.sv $(ROOT)/hw/rtl/cp/cmd_decode.sv \
   $(ROOT)/hw/rtl/cp/crc32_word.sv $(ROOT)/hw/rtl/cp/cp.sv \
@@ -127,3 +129,5 @@ check:
 
 clean:
 	rm -rf $(BUILD)
+	rm -rf *.fst
+	rm -rf *.vcd

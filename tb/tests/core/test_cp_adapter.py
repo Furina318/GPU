@@ -43,14 +43,13 @@ async def host_read(dut, addr):
     return int(dut.ram_rdata.value)
 
 
-async def cp_line_read(dut, addr, max_cycles=400):
-    """发一次 64B 行读, 返回 16 个字。"""
+async def _read_beats(dut, addr, line, max_cycles=400):
+    """发一次读, 按 AXI R 的节奏收拍: 行读 16 个字, 字读 1 个字。"""
     dut.rd_addr.value = addr
-    dut.rd_line.value = 1
+    dut.rd_line.value = line
     dut.rd_req.value = 1
     await RisingEdge(dut.clk)
     dut.rd_req.value = 0
-    # 等 ack
     acked = False
     for _ in range(max_cycles):
         await RisingEdge(dut.clk)
@@ -58,32 +57,28 @@ async def cp_line_read(dut, addr, max_cycles=400):
             acked = True
             break
     assert acked, "rd_ack 超时"
-    words = []
+    words: list[int] = []
+    err = 0
     for _ in range(max_cycles):
         await RisingEdge(dut.clk)
-        if int(dut.rd_rsp.value):
-            for w in range(16):
-                words.append((int(dut.rd_data.value) >> (32 * w)) & 0xFFFF_FFFF)
-            break
-    else:
-        raise AssertionError("rd_rsp 超时")
-    await FallingEdge(dut.clk)
-    return words, int(dut.rd_err.value)
+        if int(dut.rd_vld.value):
+            words.append(int(dut.rd_word.value) & 0xFFFF_FFFF)
+            err = int(dut.rd_err.value)
+            if int(dut.rd_last.value):
+                await FallingEdge(dut.clk)
+                return words, err
+    raise AssertionError("rd_last 超时")
+
+
+async def cp_line_read(dut, addr, max_cycles=400):
+    """发一次 64B 行读, 返回 16 个字。"""
+    return await _read_beats(dut, addr, 1, max_cycles)
 
 
 async def cp_word_read(dut, addr, max_cycles=400):
-    dut.rd_addr.value = addr
-    dut.rd_line.value = 0
-    dut.rd_req.value = 1
-    await RisingEdge(dut.clk)
-    dut.rd_req.value = 0
-    for _ in range(max_cycles):
-        await RisingEdge(dut.clk)
-        if int(dut.rd_rsp.value):
-            w0 = int(dut.rd_data.value) & 0xFFFF_FFFF
-            await FallingEdge(dut.clk)
-            return w0
-    raise AssertionError("rd_rsp 超时")
+    words, _ = await _read_beats(dut, addr, 0, max_cycles)
+    assert len(words) == 1, f"字读应当只有一拍, 实际 {len(words)} 拍"
+    return words[0]
 
 
 async def cp_word_write(dut, addr, data, max_cycles=400):

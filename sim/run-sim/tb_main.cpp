@@ -42,7 +42,7 @@ static VerilatedFstC* tfp_fst = nullptr;
 #if defined(RUNSIM_VCD)
 static VerilatedVcdC* tfp_vcd = nullptr;
 #endif
-static uint64_t sim_ns = 0;            // 波形时间轴(半周期 5ns)
+static uint64_t sim_ps = 0;            // 波形时间轴, 单位 ps(模型 timescale 是 1ps; 半周期 5ns = 5000ps)
 
 static unsigned last_busy = 0;   // trace 用:上一次打印时的总线计数
 static constexpr uint32_t LANES_PER_WARP = 8;     
@@ -59,22 +59,22 @@ static void tick(int n = 1)
         top->clk = 0;
         top->eval();
         cyc++;
-        sim_ns += 5;
+        sim_ps += 5000;
 #if defined(RUNSIM_FST)
-        if (tfp_fst) tfp_fst->dump(sim_ns);
+        if (tfp_fst) tfp_fst->dump(sim_ps);
 #endif
 #if defined(RUNSIM_VCD)
-        if (tfp_vcd) tfp_vcd->dump(sim_ns);
+        if (tfp_vcd) tfp_vcd->dump(sim_ps);
 #endif
         top->clk = 1;
         top->eval();
         cyc++;
-        sim_ns += 5;
+        sim_ps += 5000;
 #if defined(RUNSIM_FST)
-        if (tfp_fst) tfp_fst->dump(sim_ns);
+        if (tfp_fst) tfp_fst->dump(sim_ps);
 #endif
 #if defined(RUNSIM_VCD)
-        if (tfp_vcd) tfp_vcd->dump(sim_ns);
+        if (tfp_vcd) tfp_vcd->dump(sim_ps);
 #endif
         if (trace_on) {
             const unsigned bus = unsigned(top->ctr_lines) ^ unsigned(top->ctr_ar);

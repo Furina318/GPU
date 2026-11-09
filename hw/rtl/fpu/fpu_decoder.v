@@ -1,9 +1,6 @@
 // (-1)^s * 1.fraction * 2^(exponent-127) --> (-1)^s * sig * 2^exp
 
 /* verilator lint_off UNUSEDSIGNAL */
-// 浮点数据通路按算法保留满位宽(尾数 + 保护位 + 粘滞位 + 进位链余量),
-// 其中若干输入/中间位只在特定的舍入或异常路径上参与判决 —— 这些
-// "未使用"是刻意留的位宽, 删掉会改变进位链与对齐窗口。
 module fpu_decoder (
     input  wire [31:0] a,        // 单精度输入
 

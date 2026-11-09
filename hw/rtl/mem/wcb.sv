@@ -56,6 +56,37 @@ module wcb #(
 
     logic [IDX_W:0]          cnt;                     // 有效项数
 
+    // ---- 写出口:选一个待冲刷项(最小编号优先) ----
+    // 输出口 out_valid/out_line/out_wen/out_wdata 在端口表里声明, 这里只补索引。
+    logic [IDX_W-1:0]        out_idx;
+
+    // 本拍这一项正被写引擎取走。写引擎在同一个边沿就把它的数据拍进了自己的
+    // 寄存器(wr_data_q/wr_wen_q), 之后再合并进来的字永远不会被写出去 ⇒
+    // 这一项必须拒绝新的写合并, 让那次 store 去占一个空项。
+    logic                    leave_now;
+    assign leave_now = out_valid && out_ready;
+
+    always_comb begin : pick_out
+        integer oi;
+        logic   found;                  // 局部变量: 不能拿 out_valid 自己当循环条件
+        found     = 1'b0;
+        out_idx   = '0;
+        out_valid = 1'b0;
+        out_line  = '0;
+        out_wen   = '0;
+        out_wdata = '0;
+        for (oi = 0; oi < ENTRIES; oi = oi + 1) begin
+            if (vld[oi] && !found) begin
+                found     = 1'b1;
+                out_valid = 1'b1;
+                out_idx   = IDX_W'(oi);
+                out_line  = line_mem[oi];
+                out_wen   = ok_mem[oi];
+                out_wdata = dat_mem[oi];
+            end
+        end
+    end
+
     // ---- 组合查询:写命中项 / 空项 ----
     logic [IDX_W-1:0] hit_idx, free_idx;
     logic             hit_found, free_found;
@@ -67,7 +98,8 @@ module wcb #(
         free_idx   = '0;
         free_found = 1'b0;
         for (qi = 0; qi < ENTRIES; qi = qi + 1) begin
-            if (vld[qi] && (line_mem[qi] == wr_line)) begin
+            if (vld[qi] && (line_mem[qi] == wr_line) &&
+                !(leave_now && (out_idx == IDX_W'(qi)))) begin
                 hit_found = 1'b1;
                 hit_idx   = IDX_W'(qi);
             end
@@ -103,29 +135,6 @@ module wcb #(
                 for (int wi = 0; wi < WORDS; wi = wi + 1)
                     if (ok_mem[mi][wi])
                         mg_data_out[wi] = dat_mem[mi][wi];
-            end
-        end
-    end
-
-    // ---- 写出口:选一个待冲刷项(最小编号优先) ----
-    logic [IDX_W-1:0] out_idx;
-    always_comb begin : pick_out
-        integer oi;
-        logic   found;                  // 局部变量: 不能拿 out_valid 自己当循环条件
-        found     = 1'b0;
-        out_idx   = '0;
-        out_valid = 1'b0;
-        out_line  = '0;
-        out_wen   = '0;
-        out_wdata = '0;
-        for (oi = 0; oi < ENTRIES; oi = oi + 1) begin
-            if (vld[oi] && !found) begin
-                found     = 1'b1;
-                out_valid = 1'b1;
-                out_idx   = IDX_W'(oi);
-                out_line  = line_mem[oi];
-                out_wen   = ok_mem[oi];
-                out_wdata = dat_mem[oi];
             end
         end
     end

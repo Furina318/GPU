@@ -63,9 +63,9 @@ module gpu_system #(
 );
 
     //  CP
-    logic        cp_mem_rd_req, cp_mem_rd_line, cp_mem_rd_ack, cp_mem_rd_rsp, cp_mem_rd_err;
-    logic [31:0] cp_mem_rd_addr;
-    logic [16*32-1:0] cp_mem_rd_data;
+    logic        cp_mem_rd_req, cp_mem_rd_line, cp_mem_rd_ack, cp_mem_rd_err;
+    logic        cp_mem_rd_vld, cp_mem_rd_last;
+    logic [31:0] cp_mem_rd_addr, cp_mem_rd_word;
     logic        cp_mem_wr_req, cp_mem_wr_ack, cp_mem_wr_rsp, cp_mem_wr_err;
     logic [31:0] cp_mem_wr_addr;
     logic [31:0] cp_mem_wr_data;
@@ -116,8 +116,9 @@ module gpu_system #(
         .mem_rd_addr  (cp_mem_rd_addr ),
         .mem_rd_line  (cp_mem_rd_line ),
         .mem_rd_ack   (cp_mem_rd_ack  ), 
-        .mem_rd_rsp   (cp_mem_rd_rsp  ),
-        .mem_rd_data  (cp_mem_rd_data ),
+        .mem_rd_vld   (cp_mem_rd_vld  ),
+        .mem_rd_word  (cp_mem_rd_word ),
+        .mem_rd_last  (cp_mem_rd_last ),
         .mem_rd_err   (cp_mem_rd_err  ),
         .mem_wr_req   (cp_mem_wr_req  ),
         .mem_wr_addr  (cp_mem_wr_addr ),
@@ -234,8 +235,8 @@ module gpu_system #(
         .sram_load_done (cp_sram_load_done[1] ), 
         .sram_load_ovf  (cp_sram_err_ovf[1]   ),
         .sm_done        (cp_sm_done[1]        ), 
-        .sm_error       (cp_sm0_error         ), 
-        .sm_fault_pc    (cp_sm0_fault_pc      ),
+        .sm_error       (cp_sm1_error         ), 
+        .sm_fault_pc    (cp_sm1_fault_pc      ),
         .gmem_rd_valid  (sm_grd_valid[1]      ), 
         .gmem_rd_ready  (sm_grd_ready[1]      ),
         .gmem_rd_line   (sm_grd_line[1]       ), 
@@ -301,8 +302,9 @@ module gpu_system #(
         .rd_addr  (cp_mem_rd_addr), 
         .rd_line  (cp_mem_rd_line),
         .rd_ack   (cp_mem_rd_ack ), 
-        .rd_rsp   (cp_mem_rd_rsp ),
-        .rd_data  (cp_mem_rd_data), 
+        .rd_vld   (cp_mem_rd_vld ),
+        .rd_word  (cp_mem_rd_word), 
+        .rd_last  (cp_mem_rd_last), 
         .rd_err   (cp_mem_rd_err ),
         .wr_req   (cp_mem_wr_req ), 
         .wr_addr  (cp_mem_wr_addr),

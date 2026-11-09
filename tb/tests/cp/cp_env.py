@@ -117,11 +117,17 @@ class MemModel:
                 d.mem_rd_ack.value = 0
                 for _ in range(self.rd_delay):        # 可配的额外延迟
                     await RisingEdge(d.clk)
-                d.mem_rd_rsp.value = 1
-                d.mem_rd_err.value = err
-                d.mem_rd_data.value = self.poke_line(addr & ~0x3F) if line else self.peek(addr)
-                await RisingEdge(d.clk)               # rsp 被采
-                d.mem_rd_rsp.value = 0
+                # 数据按 AXI R 的节奏一拍一个字吐出(行 16 拍, 单字 1 拍)
+                base = addr & ~0x3F if line else addr & ~0x3
+                beats = 16 if line else 1
+                for b in range(beats):
+                    d.mem_rd_vld.value = 1
+                    d.mem_rd_word.value = self.peek(base + b * 4) & 0xFFFF_FFFF
+                    d.mem_rd_last.value = 1 if b == beats - 1 else 0
+                    d.mem_rd_err.value = err if b == beats - 1 else 0
+                    await RisingEdge(d.clk)
+                d.mem_rd_vld.value = 0
+                d.mem_rd_last.value = 0
                 d.mem_rd_err.value = 0
             elif int(d.mem_wr_req.value) == 1:
                 addr = int(d.mem_wr_addr.value)

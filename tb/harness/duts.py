@@ -17,10 +17,11 @@ FPU_DIR = RTL_DIR / "fpu"
 CORE_DIR = RTL_DIR / "core"
 MEM_DIR = RTL_DIR / "mem"
 CP_DIR = RTL_DIR / "cp"
+CACHE_DIR = RTL_DIR / "cache"
 #: 仿真专用胶水(不属于设计本体):tb/harness/rtl/fetch_imem_wrap.sv
 TB_RTL_DIR = Path(__file__).resolve().parent / "rtl"
 #: ``defines.vh`` 的所在目录 —— 每个 core/mem 模块都要 ``-I`` 它
-RTL_INCLUDES = (RTL_DIR, CORE_DIR, MEM_DIR, CP_DIR, FPU_DIR, TB_RTL_DIR)
+RTL_INCLUDES = (RTL_DIR, CORE_DIR, MEM_DIR, CP_DIR, FPU_DIR, CACHE_DIR, TB_RTL_DIR)
 
 
 @dataclass(frozen=True)
@@ -234,11 +235,19 @@ DUTS: dict[str, Dut] = {
         include_dirs=RTL_INCLUDES,
         test_module="tests.core.test_cp_adapter",
     ),
+    "cmd_cache": Dut(
+        name="cmd_cache",
+        toplevel="cmd_cache",
+        sources=(CACHE_DIR / "cache_sram.sv", CACHE_DIR / "cmd_cache.sv"),
+        include_dirs=RTL_INCLUDES,
+        test_module="tests.cp.test_cmd_cache",
+    ),
     "cp": Dut(
         name="cp",
         toplevel="cp",
         sources=(CP_DIR / "cp_pkg.sv", CP_DIR / "axil_slave.sv", CP_DIR / "cp_regs.sv",
-                 CP_DIR / "cmd_decode.sv", CP_DIR / "crc32_word.sv", CP_DIR / "cp.sv"),
+                 CP_DIR / "cmd_decode.sv", CP_DIR / "crc32_word.sv",
+                 CACHE_DIR / "cache_sram.sv", CACHE_DIR / "cmd_cache.sv", CP_DIR / "cp.sv"),
         include_dirs=RTL_INCLUDES + (CP_DIR,),
         test_module="tests.cp.test_cp",
     ),

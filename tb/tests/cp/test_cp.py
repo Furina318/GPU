@@ -149,6 +149,43 @@ async def test_signal_wait_readreg_irq_fence(dut):
 
 
 @cocotb.test()
+async def test_rewind_republish_reads_new_bytes(dut):
+    """`CMD_HEAD` 搬回环首重放同一段区域时,CP 必须读到**新**字节而不是缓存里的旧命令。
+
+    回归:整片失效后"发布指针"若仍停在上一次的 tail,`CMD_TAIL` 写回原值就会被判成
+    "没有新发布",缓存里(以及失效时预热进来的)旧命令会被重放。这里故意让重写发生时
+    `head < tail`(命令还没被消费),这正是驱动"重放整批命令"的形态。
+    """
+    sb = Scoreboard("rewind")
+    tb = CpTb(dut)
+    await tb.bring_up()
+
+    sem = E.SEM_BASE + 5 * 4
+    base = tb.q.tail                                        # 环首
+
+    # 第一批:写完但先不敲门(此时 head=base < tail=base+len, 命令还挂着)
+    await tb.q.submit(E.make_cmd(E.CMD_SIGNAL, [sem, 0x11]))
+    tail_after_first = tb.q.tail
+
+    # 驱动重放:HEAD 搬回环首、TAIL 也搬回环首,再写同一段区域的**新**命令
+    await E.axil_write(dut, E.MMIO_CMD_HEAD, base)
+    await E.axil_write(dut, E.MMIO_CMD_TAIL, base)
+    await E.wait_idle(dut)
+    # 让整片失效后顺手做的"活跃区预热"先把**旧字节**装满缓存(约 40 拍)
+    for _ in range(40):
+        await RisingEdge(dut.clk)
+    tb.q.tail = base
+    await tb.q.submit(E.make_cmd(E.CMD_SIGNAL, [sem, 0x22]))
+    sb.check_int(tb.q.tail, tail_after_first, "第二批的 TAIL 与第一批相同(关键前提)")
+
+    await tb.q.run()
+
+    sb.check_int(tb.mem.peek(sem), 0x22, "重放同一段区域要执行新命令,而不是重放旧命令")
+    sb.check_int(await E.axil_read(dut, E.MMIO_CP_ERROR), E.CPERR_NONE, "没有错误")
+    sb.report()
+
+
+@cocotb.test()
 async def test_params_writes_constant_region(dut):
     """PARAMS:参数块按序写进常量区(CMDS §6.10)。"""
     sb = Scoreboard("params")

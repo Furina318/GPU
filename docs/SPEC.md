@@ -229,7 +229,7 @@ RTL 综合后要回来标定 `ISA.md` §8.1 的目标值。
 | 入口 | 覆盖内容 |
 |---|---|
 | `cd sim/simulator && make test` | 文档审计(`tests/doc_consistency_check.py`:章节引用、目录锚点、变更记录编号、跨文档编码一致)+ ISA 表↔汇编器↔译码器往返(`isa_ref_check.py`)+ SIMT 栈状态机的独立实现(`stack_model_check.py`)+ 功能回归(`tests/run_tests.py`:错误路径、运行模式、2D 引擎逐像素对拍、car demo、`sg` 编译器) |
-| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(22 个 DUT 配置、121 个用例);`--werror` 打开严格 lint |
+| `cd tb && python3 run.py --all` | cocotb + Verilator 的 RTL 用例(23 个 DUT 配置、131 个用例);`--werror` 打开严格 lint |
 | `cd sim/run-sim && make check` | RTL 全系统仿真:CP + 2×SM + 内存子系统 + DDR 连起来跑 `clear`/`gouraud`/`matmul`,结果与参考模型逐位对拍 |
 
 - **参考模型是独立的第二实现**:shader 核(`sim/simulator/shader/`)、2D 引擎(`2D-engine/gfx2d.cpp` + `tests/gfx2d_ref.py`)、CP(`src/cp.cpp`)、内存子系统(`sim/simulator/src/memory.cpp`)。RTL 与模型逐位对齐,不允许"自证":同一个 `.S` 内核在两套实现上跑,结果按位比较(`sim/run-sim/`)。

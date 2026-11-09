@@ -87,6 +87,11 @@ module cp import cp_pkg::*; #(
     input  wire         mem_wr_rsp     ,
     input  wire         mem_wr_err     ,
 
+    //命令缓存统计(只读,给仿真观察用)
+    output logic [31:0] cc_hit         ,   // CP 的真实请求命中次数
+    output logic [31:0] cc_miss        ,   // CP 的真实请求缺失次数
+    output logic [31:0] cc_pref        ,   // 预取装进缓存的行数
+
     //SM
     output logic [ 1:0] sm_launch_valid,
     output logic [31:0] sm_launch_pc   ,
@@ -204,11 +209,17 @@ module cp import cp_pkg::*; #(
     logic [31:6]              cc_rsp_line;
     logic [LINE_WORDS*32-1:0] cc_rsp_data;
     logic                     cc_rsp_err;
-    logic [31:6]              cc_ring_end;  // 命令环最后一行的行号 + 1(顺序预取上界)
-    logic                     cc_inval;
+    logic [31:6]              cc_ring_base; // 命令环首行
+    logic [31:6]              cc_ring_end;  // 命令环最后一行的行号 + 1
+    logic                     cc_pub;       // 单拍:有区域被(重新)发布
+    logic [31:6]              cc_pub_s;     // 发布区域 [s, e) 的行号
+    logic [31:6]              cc_pub_e;
+    logic                     cc_inval_all; // 整片失效
     logic                     cc_busy;      // 缓存占着内存口
     logic                     cc_m_rd_req;
     logic [31:0]              cc_m_rd_addr;
+    logic [31:0]              cc_ctr_hit, cc_ctr_miss, cc_ctr_pref;
+    logic [31:0]              cc_ctr_pub, cc_ctr_inval, cc_ctr_rdline;
     logic                     cc_rd_ack, cc_rd_vld, cc_rd_last, cc_rd_err;
     logic [31:0]              cc_rd_word;
     logic                     cp_rd_ack, cp_rd_vld, cp_rd_last, cp_rd_err, cp_rd_req;
@@ -224,7 +235,6 @@ module cp import cp_pkg::*; #(
     logic [ 3:0] cp_error;
     logic        doorbell_pend;
     logic        ext_wr, ext_rd, cp_reset_evt, doorbell_evt, chk_wr_ok;
-    `UNUSED_VAR(doorbell_evt)         
     logic [11:0] ext_addr, chk_addr, int_addr;
     logic [31:0] ext_wdata, int_rdata, regs_ext_rdata;
     logic        int_wr, head_we, img_we;
@@ -474,20 +484,81 @@ module cp import cp_pkg::*; #(
     wire [31:0] mem_word = mem_rd_word;
     wire        mem_err = (mop == OP_RD_WORD) ? cp_rd_err : mem_wr_err;
 
-    // 失效:凡是"能让命令环字节变"的动作都在这里 —— 复位、发布(DOORBELL)、
-    // 以及直接改环的指针/基址/大小(驱动可能借它们让 CP 从别处开始读)。
-    // 命令环的唯一写者是 host,而且它必须先把命令写完、再写 TAIL/DOORBELL,
-    // 所以这几种事件之后缓存里的行都可能过期。
-    wire ring_cfg_wr = ext_wr & ((ext_addr == {4'h0, `MMIO_CMD_HEAD})   |
-                                 (ext_addr == {4'h0, `MMIO_CMD_TAIL})   |
-                                 (ext_addr == {4'h0, `MMIO_CMD_QUEUE_BASE}) |
-                                 (ext_addr == {4'h0, `MMIO_CMD_QUEUE_SIZE}));
-    assign cc_inval = cp_reset_evt | doorbell_evt | ring_cfg_wr;
+    // ── 失效按"范围"而不是"全片" ──────────────────────────────────────────
+    // 驱动协议:先把命令字节写进环,再写 TAIL(或 DOORBELL)把它发布出来。因此
+    //   * 写 TAIL 前进的那一段 [tail_pub, 新 tail) 才是"可能变了"的区域 —— 只失效它;
+    //   * 没写 TAIL 就敲门(就地重发布)则失效整个活跃区 [head, tail);
+    //   * 只有 CP_RESET 与搬动整个读区域的 CMD_HEAD / QUEUE_BASE / QUEUE_SIZE 才全片失效。
+    // 发布事件同时踢一脚预取:缓存会在后台把新区域填好(CP 这时可能在等 SM)。
+    wire tail_wr = ext_wr & (ext_addr == {4'h0, `MMIO_CMD_TAIL});
+    wire head_wr = ext_wr & (ext_addr == {4'h0, `MMIO_CMD_HEAD});
+    wire base_wr = ext_wr & (ext_addr == {4'h0, `MMIO_CMD_QUEUE_BASE});
+    wire size_wr = ext_wr & (ext_addr == {4'h0, `MMIO_CMD_QUEUE_SIZE});
 
-    // 顺序预取的上界交给缓存:它自己往"下一行"预取, 不需要 CP 每返回一行就推一次。
-    // 只预取**起始地址落在环内**的行 —— 环外(以及 tail 之后还没发布的区域)读进来
-    // 也没关系:host 每次写 TAIL/DOORBELL 都会让缓存整片失效。
-    assign cc_ring_end = 26'((queue_base + queue_size) >> 6);
+    logic [31:6] tail_pub;      // 已经发布过的 tail(行号)
+    logic        tail_seen;     // 上一次发布是靠写 TAIL 做的
+
+    assign cc_ring_base = queue_base[31:6];
+    assign cc_ring_end  = 26'((queue_base + queue_size) >> 6);
+
+    wire [31:0] tail_pub_b = {tail_pub, 6'b0};
+    // 正常情况下 TAIL 只会向前走且不越过环尾;反向写/越界写无法界定范围,退化为全片失效
+    wire tail_adv = tail_wr & (ext_wdata > tail_pub_b) & (ext_wdata <= (queue_base + queue_size));
+    wire tail_bad = tail_wr & ~tail_adv & (ext_wdata != tail_pub_b);
+    // 没写 TAIL 就敲门:host 就地重发布,活跃区 [head, tail) 都可能变
+    wire door_repub = doorbell_evt & ~tail_seen & (tail[31:6] != head[31:6]);
+
+    assign cc_inval_all = cp_reset_evt | head_wr | base_wr | size_wr | tail_bad;
+
+    always_comb begin
+        cc_pub   = 1'b0;
+        cc_pub_s = tail_pub;
+        cc_pub_e = tail_pub;
+        if (tail_adv) begin
+            cc_pub   = 1'b1;
+            cc_pub_s = tail_pub;
+            cc_pub_e = ext_wdata[31:6];
+        end
+        else if (door_repub) begin
+            cc_pub   = 1'b1;
+            cc_pub_s = head[31:6];
+            cc_pub_e = tail[31:6];
+        end
+        else if (cc_inval_all) begin
+            // 全片失效之后顺手把活跃区预热回来
+            cc_pub_s = head[31:6];
+            cc_pub_e = tail[31:6];
+            cc_pub   = (head[31:6] != tail[31:6]);
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            tail_pub  <= QUEUE_BASE_DEF[31:6];
+            tail_seen <= 1'b0;
+        end
+        else if (cp_reset_evt) begin
+            // CP_RESET:head := tail,环内容不变但整个读区域要重读;
+            // 发布指针退回环首,这样下一次写 TAIL 看起来总是"从环首发布"
+            tail_pub  <= QUEUE_BASE_DEF[31:6];
+            tail_seen <= 1'b0;
+        end
+        else if (tail_adv) begin
+            tail_pub  <= ext_wdata[31:6];
+            tail_seen <= 1'b1;
+        end
+        else if (doorbell_evt) begin
+            tail_seen <= 1'b0;
+            if (door_repub) tail_pub <= tail[31:6];
+        end
+        else if (cc_inval_all) begin
+            // 整片失效意味着整个读区域要重读(典型场景:驱动把 CMD_HEAD 搬回环首重放)。
+            // 发布指针也退回环首:否则"改写同一段区域、TAIL 又写回原值"会被判成
+            // 没有前进 ⇒ 一段本该作废的行被当成仍有效(踩过:重放批次读到上一批的字节)。
+            tail_pub  <= queue_base[31:6];
+            tail_seen <= 1'b0;
+        end
+    end
 
     cmd_cache #(
         .ADDR_W     (32        ),
@@ -502,8 +573,12 @@ module cp import cp_pkg::*; #(
         .rsp_line   (cc_rsp_line),
         .rsp_data   (cc_rsp_data),
         .rsp_err    (cc_rsp_err ),
+        .pub_valid  (cc_pub     ),
+        .pub_start_line(cc_pub_s),
+        .pub_end_line  (cc_pub_e),
+        .inval_all  (cc_inval_all),
+        .ring_base_line(cc_ring_base),
         .ring_end_line(cc_ring_end),
-        .invalidate (cc_inval   ),
         .port_free  (~cp_port_busy),
         .m_rd_req   (cc_m_rd_req),
         .m_rd_addr  (cc_m_rd_addr),
@@ -512,8 +587,22 @@ module cp import cp_pkg::*; #(
         .m_rd_word  (cc_rd_word ),
         .m_rd_last  (cc_rd_last ),
         .m_rd_err   (cc_rd_err  ),
-        .busy       (cc_busy    )
+        .busy       (cc_busy    ),
+        .ctr_hit    (cc_ctr_hit   ),
+        .ctr_miss   (cc_ctr_miss  ),
+        .ctr_pref   (cc_ctr_pref  ),
+        .ctr_pub    (cc_ctr_pub   ),
+        .ctr_inval  (cc_ctr_inval ),
+        .ctr_rdline (cc_ctr_rdline)
     );
+
+    // 统计口:命中/缺失/预取装载 给仿真观察(发布与失效次数内部留存,不引出)
+    assign cc_hit  = cc_ctr_hit;
+    assign cc_miss = cc_ctr_miss;
+    assign cc_pref = cc_ctr_pref;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [95:0] cc_stat_un = {cc_ctr_rdline, cc_ctr_pub, cc_ctr_inval};
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // 指令 SRAM 预加载(广播到 sm_mask 选中的 SM)
     logic sram_en_q, sram_last_q;

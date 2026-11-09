@@ -59,7 +59,10 @@ module gpu_system #(
     output logic [31:0] ctr_unmapped,       // 未映射地址次数(应为 0)
     output logic [31:0] ctr_shared_extra,   // 共享内存 bank 冲突的额外拍数
     output logic [31:0] ctr_ar,             // 仲裁器主口上的 AR 事务数
-    output logic [31:0] ctr_aw              // 仲裁器主口上的 AW 事务数
+    output logic [31:0] ctr_aw,             // 仲裁器主口上的 AW 事务数
+    output logic [31:0] ctr_cc_hit,         // CP 命令缓存:真实请求命中次数
+    output logic [31:0] ctr_cc_miss,        // CP 命令缓存:真实请求缺失次数
+    output logic [31:0] ctr_cc_pref         // CP 命令缓存:预取装进来的行数
 );
 
     //  CP
@@ -138,6 +141,9 @@ module gpu_system #(
         .sm0_fault_pc    (cp_sm0_fault_pc  ), 
         .sm1_fault_pc    (cp_sm1_fault_pc  ),
         .sm_err_clr      (cp_sm_err_clr    ),
+        .cc_hit          (ctr_cc_hit       ),
+        .cc_miss         (ctr_cc_miss      ),
+        .cc_pref         (ctr_cc_pref      ),
 
         .sram_load_en   (cp_sram_load_en   ), 
         .sram_load_addr (cp_sram_load_addr ),

@@ -148,7 +148,7 @@ tb/
 ├── tests/cp/               # command processor + CRC32
 │   ├── cp_env.py           # memory model, AXI4-Lite host, SM/engine/SRAM mocks
 │   ├── test_cp.py
-│   ├── test_cmd_cache.py   # cmd_cache: miss/hit, conflict, prefetch, invalidate
+│   ├── test_cmd_cache.py   # cmd_cache: miss/hit, conflict, publish-prefetch, range/all invalidate
 │   └── test_crc32.py
 ├── tests/core/             # shader core front end + instruction memory
 │   ├── stack_model.py      # ISA §2.3.3 reference model + a mini datapath
@@ -223,7 +223,7 @@ model follows RISC-V (every NaN-producing arithmetic op returns the canonical
 
 ## 5. What is covered
 
-127 tests over 23 DUT configurations: 30 on the FPU (all green on **both**
+131 tests over 23 DUT configurations: 30 on the FPU (all green on **both**
 simulators, stable across `TB_SEED=0..11` -- a 12-seed sweep is a good regression
 to run after any RTL change) plus 95 on the shader core front end, the memory
 subsystem, the LSU, the SM top level, the command processor and its command
@@ -284,7 +284,7 @@ transcriptions of the same rules rather than against itself.
 | DUT | tests | coverage |
 |---|---|---|
 | `cp` | 15 | CMDS §7 register file (reset values, RO, write-any-value-clears, `CP_STATUS`), NOP/variable-length walk + `IRQ_ON_DONE`, SIGNAL/WAIT/READ_REG/IRQ/FENCE/PARAMS, queue boundary errors (len<2, past `CMD_TAIL`, reserved opcode, reserved `cmd_flags`), `WAIT` timeout and real `wait_id` blocking, `LOAD_KERNEL` (header + CRC + both SMs' instruction SRAM + `SM_KERNEL_MASK`) followed by LAUNCH to `SM_DONE` (semaphore + `IRQ_LAUNCH_DONE`), CRC/flag mismatch, `LAUNCH_REJECT` / `STALE_SM_ERROR` ordering, SM fault without signalling, GEMM/2D payload dispatch, engine fault, `CP_RESET` semantics, `BUS_ERROR` on a queue read, and the queue-pointer register rules (§2.1/§6.2/§7: `CMD_QUEUE_SIZE` must be `>= 8` and a multiple of 8, `CMD_QUEUE_BASE` 4B-aligned outside the MMIO window, `CMD_HEAD` in-range and 4B-aligned and **host-only**; IDLE-only timing; the command path reports `CMD_ERROR`/`ILLEGAL_STATE` while a host MMIO write is silently ignored) -- including the check that a host write moving `head` back onto already-consumed commands makes the CP **re-read the queue from memory** instead of reusing its line buffer |
-| `cmd_cache` | 7 | the CP's command-line cache on its own: miss fills beat by beat from the bus and the second read hits with zero extra bus traffic (<= 4 cycles), two lines mapping to the same set evict each other, the *internal* prefetcher warms line L+1 after a real request so the following read hits (and stops at `ring_end_line`), `invalidate` (epoch bump) forces a refill with fresh data, `port_free=0` defers the fill (no bus read, no `rsp`, `busy` stays 0 -- the mutual-exclusion rule that keeps the CP from deadlocking against itself), and a bus-error line is reported but **not** installed in the cache |
+| `cmd_cache` | 11 | the CP's command-line cache on its own: miss fills beat by beat from the bus and the second read hits with zero extra bus traffic (<= 4 cycles), two lines mapping to the same set evict each other, the internal prefetcher warms line L+1 after a real request, a `pub_valid` publish background-fills the whole published window (3 lines, then every read hits), the cursor **wraps at the ring end**, a publish that stops at the ring end reads nothing outside the ring, a **range** invalidate only drops the republished lines while an untouched neighbour still hits, `inval_all` forces a refill, `port_free=0` defers the fill (no bus read, no `rsp`, `busy` stays 0 -- the mutual-exclusion rule that keeps the CP from deadlocking against itself), and a bus-error line is reported but **not** installed in the cache, and a **publish during an in-flight fill** drops the stale bytes so the request re-reads the new command |
 | `crc32_word` | 1 | CRC-32/ISO-HDLC word-at-a-time against `zlib.crc32` (standard vector, a real kernel image, 20 random streams) -- this is what makes `LOAD_KERNEL`'s header check trustworthy |
 
 The `cp` testbench plays the environment (see `tests/cp/cp_env.py`): a sparse global

@@ -999,6 +999,14 @@ int main(int argc, char** argv)
                 n_frames ? double(cyc - c0) / double(n_frames) : 0.0);
     std::printf("统计: 行请求 %u, MMIO %u, 未映射 %u\n",
                 top->ctr_lines, top->ctr_mmio, top->ctr_unmapped);
+    {
+        const unsigned hit  = unsigned(top->ctr_cc_hit);
+        const unsigned miss = unsigned(top->ctr_cc_miss);
+        const unsigned tot  = hit + miss;
+        std::printf("命令缓存: 命中 %u, 缺失 %u, 预取装载 %u 行(命中率 %.1f%%)\n",
+                    hit, miss, unsigned(top->ctr_cc_pref),
+                    tot ? (100.0 * double(hit) / double(tot)) : 0.0);
+    }
 
     if (!dump.empty()) {
         FILE* g = std::fopen(dump.c_str(), "wb");
